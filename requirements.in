@@ -1,0 +1,9 @@
+httpx==0.28.1
+bittensor-wallet==4.1.0
+bittensor==11.3.5
+mujoco==4.0.1
+numpy==2.5.5
+pyyaml==6.0.3
+scipy==1.18.1
+huggingface_hub==2.4.0
+pytest==9.2.0
