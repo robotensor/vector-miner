@@ -1,0 +1,12 @@
+{
+  "name": "vector-example-expert",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "description": "An almost blind vector-expert/2 expert: the message loop with the harness, ready to replace with your own planner",
+  "dependencies": {
+    "@vector/sim": "file:../../vector-sim/js"
+  }
+}
