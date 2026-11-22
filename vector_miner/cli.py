@@ -76,16 +76,26 @@ def cmd_eval(a) -> int:
 
 def cmd_verify(a) -> int:
     from .verify import VerifyError, verify
+
+    def bad(msg: str) -> int:
+        print(f"vector-miner: {msg}", file=sys.stderr)
+        return 2
+
     if a.command and not a.image:
-        raise SystemExit("--command replaces an evaluated image: give --image REF too")
+        return bad("--command replaces an evaluated image: give --image REF too")
     if a.doc:
-        with open(a.doc) as f:
-            doc = json.load(f)
-        if int(doc.get("round", -1)) != a.round:
-            raise SystemExit(f"{a.doc} is round {doc.get('round')}, not {a.round}")
+        try:
+            with open(a.doc) as f:
+                doc = json.load(f)
+        except (OSError, ValueError) as e:
+            return bad(f"cannot read {a.doc}: {e}")
+        if not isinstance(doc, dict):
+            return bad(f"{a.doc} is not a verify document")
+        if str(doc.get("round")) != str(a.round):
+            return bad(f"{a.doc} is round {doc.get('round')}, not {a.round}")
     else:
         if not a.api:
-            raise SystemExit("--api (or VECTOR_MINER_API) is required without --doc")
+            return bad("--api (or VECTOR_MINER_API) is required without --doc")
         from .api import Api, ApiError
         try:
             doc = Api(a.api).round_verify(a.round)

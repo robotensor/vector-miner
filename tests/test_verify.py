@@ -163,7 +163,7 @@ def test_a_partial_check_and_a_disagreeing_rerun(monkeypatch, capsys, env, tmp_p
     assert code2 == 0 and out2["rerun"] == rr
 
 
-def test_not_final_unknown_image_and_bad_arguments(monkeypatch, capsys, env):
+def test_not_final_unknown_image_and_bad_arguments(monkeypatch, capsys, env, tmp_path):
     doc = make_doc(fake_env(broken=env.scenes.broken))
     serve(monkeypatch, doc, final=False)
     code, out, err = run(capsys, "--round", "4", "--api", "http://api")
@@ -173,11 +173,24 @@ def test_not_final_unknown_image_and_bad_arguments(monkeypatch, capsys, env):
     assert code == 2 and "was not evaluated in round 4" in err and IMG in err
     code, _, err = run(capsys, "--round", "4", "--api", "http://api", "--image", "5Hot0")
     assert code == 2 and "not published" in err
-    with pytest.raises(SystemExit, match="--image"):
-        cli.main(["verify", "--round", "4", "--api", "http://api", "--command", "x"])
+    code, out, err = run(capsys, "--round", "4", "--api", "http://api", "--command", "x")
+    assert code == 2 and out is None and "--image" in err
     monkeypatch.delenv("VECTOR_MINER_API", raising=False)
-    with pytest.raises(SystemExit, match="--api"):
-        cli.main(["verify", "--round", "4"])
+    code, out, err = run(capsys, "--round", "4")
+    assert code == 2 and out is None and "--api" in err
+    other = tmp_path / "round5.json"
+    other.write_text(json.dumps({**doc, "round": 5}))
+    code, out, err = run(capsys, "--round", "4", "--doc", str(other))
+    assert code == 2 and out is None and "is round 5, not 4" in err
+    code, out, err = run(capsys, "--round", "4", "--doc", str(tmp_path / "missing.json"))
+    assert code == 2 and out is None and "cannot read" in err
+    broken = tmp_path / "broken.json"
+    broken.write_text("{")
+    code, out, err = run(capsys, "--round", "4", "--doc", str(broken))
+    assert code == 2 and out is None and "cannot read" in err
+    with pytest.raises(SystemExit) as e:
+        cli.main(["verify"])
+    assert e.value.code == 2
 
 
 def _tampered(doc, fn):

@@ -86,7 +86,7 @@ vector-miner eval (--command "..." | --image REF) [--scenes 20] [--seed 0] [--wo
 vector-miner commit --image REF --netuid <netuid> [--network finney] [--wallet.name --wallet.hotkey --wallet.path] [--no-check]
 vector-miner status --api https://vector.robotensor.ai [--hotkey <ss58>] [--rounds 3] [--wallet.name --wallet.hotkey]
 vector-miner verify --round N (--api https://vector.robotensor.ai | --doc FILE) [--save FILE] [--hash-scenes M]
-                    [--image REF [--command "..."] [--scenes 20] [--sample-seed 0] [--workers 1] [--wall 45]
+                    [--image REF [--command "..."] [--scenes 20] [--sample-seed 0] [--workers 1] [--wall S]
                     [--cpus 4] [--memory 8g] [--docker docker] [--pull]]
 ```
 
@@ -95,7 +95,8 @@ vector-miner verify --round N (--api https://vector.robotensor.ai | --doc FILE) 
   round does: `--network none`, read-only root filesystem, `/tmp` in memory (1 GB), user 65534 with `HOME=/tmp`,
   no capabilities, 256 processes, 1024 open files, `--cpus 4 --memory 8g`, 15 s of robot time and 45 s of wall
   time per scene. The image must already be local (`--pull` pulls it first). `--results` writes one JSON line per
-  scene. Change the limits only to experiment: the round uses the defaults.
+  scene. Change the limits only to experiment: the round uses the defaults. Without an asset bundle (see
+  vector-env) `eval` prints the reason and exits 2.
 - `commit` applies the subnet's checks before it sends anything: the reference is
   `<registry>/<repo>@sha256:<64 hex>` (lower case, no tag), at most 128 characters, and the registry is `ghcr.io`.
   It then asks the registry anonymously for that digest, as the subnet does: a private image, an unknown digest or
@@ -147,13 +148,17 @@ flowchart LR
   that beat the king's re-run by more than the margin.
 - Regeneration needs the same vector-env version and asset bundle as the round (`env` in the document); with
   another one, the output warns and hashes can differ.
-- `--image` takes an evaluated image's reference, digest or hotkey. It runs `run_image` (what the round ran: the
-  king from its mirror) on `--scenes` scenes sampled with `--sample-seed`, or `--command` instead, and reports
+- `--image` takes an evaluated image's reference, digest or hotkey. It runs that image's published `run_image` (the
+  reference the round ran) on `--scenes` scenes sampled with `--sample-seed`, or `--command` instead, and reports
   `agreement` (same success), `outcome_agreement`, the time difference and every disagreeing scene. A different
   machine can change a few borderline outcomes; the published results are what the round decided on.
+  `--wall` defaults to the round's `wall_s` (else vector-env's `harness.wall_s`).
 - `--save FILE` keeps the document; `--doc FILE` checks a saved one offline. The output is one JSON object.
-  Exit 0: the document adds up and every regenerated scene matches; 1: a mismatch (listed); 2: the round is not
-  final, or a bad argument.
+  Exit codes: 0 = the document adds up and every regenerated scene matches; 1 = a document problem or a scene
+  mismatch (listed in the output); 2 = cannot check: a bad argument (`--command` without `--image`, no `--api`
+  without `--doc`, a `--doc` that is unreadable or of another round), the round is not final (404) or the API
+  failed, the image was not evaluated in the round, or vector-env is missing. Re-run disagreements are reported
+  under `rerun` and do not change the exit code.
 
 The example image (`example/Dockerfile`) runs as user 65534 with `HOME=/tmp` and writes nothing outside `/tmp`.
 Files your image reads must be readable by that user.
