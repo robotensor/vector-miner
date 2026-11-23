@@ -14,7 +14,7 @@ from .verify import (MAX_SCENES, VerifyError, _arr, _bad, _env, _flag, _int, _nu
 try:
     from vector_env.rules import INFRA_OUTCOMES
 except ImportError:
-    INFRA_OUTCOMES = ("harness_error", "scene_error", "docker_unavailable", "image_missing", "pull_failed", "start_failed")
+    INFRA_OUTCOMES = ("harness_error", "scene_error", "docker_unavailable", "image_missing", "pull_failed", "start_failed", "policy_unavailable")
 
 FORMAT = "vector-submission-verify/1"
 SEED_N = 0
