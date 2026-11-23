@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import os
 import signal
@@ -31,8 +32,8 @@ def expert(mode="track", per=5):
 
 
 class FakeServer:
-    def __init__(self, script, refuse=None):
-        self.script, self.refuse = script, refuse
+    def __init__(self, script, refuse=None, refusals=None):
+        self.script, self.refuse, self.refusals = script, refuse, list(refusals or [])
         self.nonces, self.hellos, self.closes = set(), [], []
         self.conns = 0
 
@@ -57,6 +58,12 @@ class FakeServer:
             return
         if self.refuse:
             await ws.close(*self.refuse)
+            return
+        if self.refusals:
+            err, code, reason = self.refusals.pop(0)
+            if err is not None:
+                await ws.send(json.dumps({"type": "error", **err}))
+            await ws.close(code, reason)
             return
         self.conns += 1
         try:
@@ -152,6 +159,25 @@ def test_ws_url_and_close_codes():
         sv.ws_url("vector.example")
     assert sv.fatal_close(1008) and sv.fatal_close(4003) and not sv.fatal_close(1011) and not sv.fatal_close(1000)
     assert not sv.fatal_close(None)
+    assert not sv.fatal_close(4429, "busy: every phase-1 slot is in use")
+    busy = sv.refusal(4429, "busy: try again", {"type": "error", "reason": "busy", "message": "m", "retry_after_s": 120})
+    assert busy["wait_s"] == 120 and not busy["final"] and busy["message"] == "m"
+    assert sv.refusal(4429, "busy: try again")["wait_s"] == sv.BUSY_WAIT_S
+    now = sv._when("2026-11-23T10:00:00+00:00")
+    later = sv.refusal(4403, "not_open: phase 1 hit failures", {"reason": "not_open", "retry_at": "2026-11-23T16:00:00Z"},
+                       now=now)
+    assert not later["final"] and later["wait_s"] == 6 * 3600 and later["retry_at"] == "2026-11-23T16:00:00Z"
+    over = sv.refusal(4403, "not_open: phase 1 of submission s is over (status crowned)")
+    assert over["final"] and over["reason"] == "not_open" and over["message"].startswith("phase 1 of submission")
+    for code, reason in ((4403, "image: hello.image is not the committed image (x)"),
+                         (4404, "unknown: no submission for this hotkey"),
+                         (4401, "bad_hello: the signature does not verify (sr25519 over ...)"),
+                         (4409, "replaced: a newer connection of this hotkey took over"),
+                         (4403, "duplicate_hotkey: this hotkey already has a submission")):
+        assert sv.fatal_close(code, reason), reason
+    nonce = sv.refusal(4401, "bad_hello: unknown or expired nonce (GET /v1/expert/nonce)")
+    assert not nonce["final"] and nonce["nonce"]
+    assert not sv.fatal_close(4408, "timeout: send the hello within 10 s")
 
 
 def test_hello_is_signed_and_scenes_are_bridged_by_key(pids):
@@ -159,7 +185,8 @@ def test_hello_is_signed_and_scenes_are_bridged_by_key(pids):
 
     async def script(ws, srv):
         r = Router(ws)
-        await ws.send(json.dumps({"type": "welcome", "submission": "sub-1", "done": 0, "total": 3}))
+        await ws.send(json.dumps({"type": "welcome", "submission": "sub-1", "status": "phase1", "done": 0, "scenes": 3,
+                                  "first_step_deadline_s": 10.0, "step_deadline_s": 2.0}))
         await asyncio.gather(*(r.play(i, f"{i}.0", got=got) for i in range(3)))
         await ws.send(json.dumps({"type": "done"}))
         await asyncio.sleep(0.2)
@@ -536,3 +563,82 @@ def test_the_real_harness_over_the_socket_matches_a_local_run(scenes2, drop):
     assert all(r["outcome"] not in ("disconnected", "harness_error", "step_timeout") for r in remote), remote
     if drop:
         assert any(r["restarts"] >= 1 for r in remote), remote
+
+
+def test_busy_and_not_open_with_retry_at_are_retried_and_real_refusals_stop(pids):
+    logs = []
+    soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=0.05)).isoformat()
+    got = {}
+
+    async def script(ws, srv):
+        r = Router(ws)
+        await ws.send(json.dumps({"type": "welcome", "submission": "sub-1", "status": "phase1", "done": 0, "scenes": 1}))
+        await r.play(0, "0.0", got=got)
+        await ws.send(json.dumps({"type": "done", "submission": "sub-1", "status": "scored", "score": 0.0,
+                                  "successes": 0, "scenes": 1}))
+        await asyncio.sleep(0.2)
+
+    refusals = [({"reason": "busy", "message": "every phase-1 slot is in use", "retry_after_s": 0.02}, 4429,
+                 "busy: every phase-1 slot is in use"),
+                (None, 4429, "busy: too many miners"),
+                ({"reason": "not_open", "message": "phase 1 hit failures on our side", "submission": "sub-1",
+                  "status": "review", "retry_at": soon}, 4403, "not_open: phase 1 hit failures on our side")]
+
+    async def main(refusals, **kw):
+        async with FakeServer(script, refusals=refusals) as srv:
+            code = await sv.serve(srv.api, REF, KP, sv.Launcher(expert()), concurrency=1, warm=0, backoff=FAST,
+                                  log=logs.append, **kw)
+            return code, srv
+
+    sv_busy = sv.BUSY_WAIT_S
+    sv.BUSY_WAIT_S = 0.02
+    try:
+        code, srv = run(main(refusals))
+    finally:
+        sv.BUSY_WAIT_S = sv_busy
+    assert code == 0 and srv.conns == 1 and len(srv.hellos) == 4, logs
+    assert len(got["0.0"]) == 15
+    assert any("turned the connection away for now (close 4429: busy: every phase-1 slot" in x for x in logs), logs
+    assert any("it opens again at " + soon in x for x in logs), logs
+    assert any(x.startswith("connected: submission sub-1, status phase1, 0/1 scenes done") for x in logs), logs
+    assert any("phase 1 is finished: status scored, score 0.0 (0/1)" in x for x in logs), logs
+    logs.clear()
+    code, srv = run(main([({"reason": "image", "message": "hello.image is not the committed image (ghcr.io/x)"}, 4403,
+                           "image: hello.image is not the committed image (ghcr.io/x)")]))
+    assert code == 1 and len(srv.hellos) == 1
+    assert any("refused this miner (close 4403): image: hello.image is not the committed image" in x for x in logs), logs
+    logs.clear()
+    code, srv = run(main([({"reason": "not_open", "message": "phase 1 of submission sub-1 is over (status crowned)",
+                            "status": "crowned"}, 4403, "not_open: phase 1 of submission sub-1 is over")]))
+    assert code == 1 and len(srv.hellos) == 1 and any("is over (status crowned)" in x for x in logs), logs
+    logs.clear()
+    nonce = ({"reason": "bad_hello", "message": "unknown or expired nonce (GET /v1/expert/nonce)"}, 4401,
+             "bad_hello: unknown or expired nonce (GET /v1/expert/nonce)")
+    code, srv = run(main([nonce] * (sv.NONCE_RETRIES + 1)))
+    assert code == 1 and len(srv.hellos) == sv.NONCE_RETRIES + 1, logs
+
+
+def test_a_review_at_the_end_of_phase1_waits_for_retry_at(pids):
+    logs = []
+    soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=0.05)).isoformat()
+
+    async def script(ws, srv):
+        await ws.send(json.dumps({"type": "error", "reason": "notice", "message": "just saying"}))
+        if srv.conns == 1:
+            await ws.send(json.dumps({"type": "done", "submission": "sub-1", "status": "review", "score": None,
+                                      "retry_at": soon}))
+        else:
+            await ws.send(json.dumps({"type": "done", "submission": "sub-1", "status": "scored", "score": 0.5,
+                                      "successes": 1, "scenes": 2}))
+        await asyncio.sleep(0.2)
+
+    async def main():
+        async with FakeServer(script) as srv:
+            code = await sv.serve(srv.api, REF, KP, sv.Launcher(expert()), concurrency=1, warm=0, backoff=FAST,
+                                  log=logs.append)
+            return code, srv
+
+    code, srv = run(main())
+    assert code == 0 and srv.conns == 2, logs
+    assert any("the server says: notice: just saying" in x for x in logs), logs
+    assert any("phase 1 runs again from " + soon in x and "keep serve running" in x for x in logs), logs

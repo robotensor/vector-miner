@@ -46,4 +46,6 @@ for line in sys.stdin:
             continue
         if mode == "hang":
             time.sleep(3600)
+    if mode == "lag" and m["type"] == "state":
+        time.sleep(1.0)
     send({"type": "act", "rows": rows(m), "obs": False})
