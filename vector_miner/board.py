@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 FINAL = ("below_king", "crowned", "not_crowned", "disqualified", "duplicate_hotkey", "invalid", "copy", "abandoned")
-REFUSED = ("duplicate_hotkey",)
+NO_SLOT = ("duplicate_hotkey", "invalid", "copy")
 
 
 def _num(v):
@@ -58,9 +58,11 @@ def verdict(s: dict, king: dict, margin: float | None) -> str:
     if st == "duplicate_hotkey":
         return "refused: this hotkey already had a submission (one per hotkey, ever)"
     if st == "invalid":
-        return f"invalid: {why or 'no reason given'}"
+        return (f"invalid: {why or 'no reason given'}; it did not use this hotkey's submission, the hotkey may "
+                "commit again")
     if st == "copy":
-        return f"a copy of an earlier submission: {why or 'the same image digest'}"
+        return (f"a copy of an earlier submission: {why or 'the same image digest'}; it did not use this hotkey's "
+                "submission, the hotkey may commit again")
     if st == "abandoned":
         return "abandoned: no miner connection within 48 h of the commit; final"
     return f"status {st}"
@@ -79,20 +81,29 @@ def status(api, hotkey: str) -> dict:
     margin = _num(ex.get("margin"))
     subs = [view(s, king, margin) for s in api.submissions(hotkey)]
     out = {"hotkey": hotkey, "king": king.get("hotkey") == hotkey, "king_hotkey": king.get("hotkey"),
-           "king_best": _num(king.get("best_score", king.get("score"))), "margin": margin, "submissions": subs}
+           "king_image": king.get("image"), "king_best": _num(king.get("best_score", king.get("score"))),
+           "margin": margin, "submissions": subs}
+    if king and not king.get("image"):
+        out["king_note"] = "king: no image published"
     if not subs:
         out["note"] = "no submission from this hotkey yet: vector-miner commit --image <image@sha256:...>, then vector-miner serve"
     return out
 
 
+def _block(x: dict) -> int:
+    b = x.get("commit_block")
+    return b if isinstance(b, int) and not isinstance(b, bool) else 1 << 62
+
+
 def existing(rows: list[dict]) -> dict | None:
-    keep = [x for x in rows if x.get("status") not in REFUSED] or rows
-    return keep[0] if keep else None
+    keep = [x for x in rows if x.get("status") not in NO_SLOT]
+    return min(keep, key=_block) if keep else None
 
 
 def refusal(hotkey: str, s: dict) -> str:
     return (f"vector-miner: hotkey {hotkey} already has submission {s.get('id')} ({s.get('image')}, "
             f"status {s.get('status')}, committed {s.get('committed_at')}). The subnet takes one submission per "
-            "hotkey, ever: another commit from this hotkey would be refused as duplicate_hotkey and never evaluated. "
-            "To submit another image, register a new hotkey (btcli subnet register) and commit from it; "
+            f"hotkey, ever, and a submission in {s.get('status')} uses it (only invalid, copy and duplicate_hotkey "
+            "commits leave it free): another commit from this hotkey would be refused as duplicate_hotkey and never "
+            "evaluated. To submit another image, register a new hotkey (btcli subnet register) and commit from it; "
             "vector-miner status shows how this one is doing")

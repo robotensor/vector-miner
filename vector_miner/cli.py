@@ -110,8 +110,9 @@ def cmd_status(a) -> int:
     print(json.dumps(out, indent=1))
     for s in out["submissions"]:
         print(f"vector-miner: {s['id']}: {s['verdict']}", file=sys.stderr)
-    if out.get("note"):
-        print(f"vector-miner: {out['note']}", file=sys.stderr)
+    for k in ("king_note", "note"):
+        if out.get(k):
+            print(f"vector-miner: {out[k]}", file=sys.stderr)
     return 0
 
 

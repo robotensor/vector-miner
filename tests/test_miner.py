@@ -107,7 +107,7 @@ def test_commit_sends_the_checked_reference(monkeypatch, capsys):
         cli.main(["commit", "--image", f"docker.io/alice/x@{D}", "--no-check", "--dev-api", "http://api"])
 
 
-@pytest.mark.parametrize("status", ["phase1", "below_king", "invalid", "abandoned"])
+@pytest.mark.parametrize("status", ["waiting_connection", "phase1", "review", "below_king", "abandoned"])
 def test_commit_refuses_a_hotkey_that_already_has_a_submission(monkeypatch, status):
     alice = Keypair.create_from_uri("//Alice")
     monkeypatch.setattr(cli, "_keypair", lambda a: alice)
@@ -123,6 +123,23 @@ def test_commit_refuses_a_hotkey_that_already_has_a_submission(monkeypatch, stat
         msg = str(e.value.code)
         assert f"already has submission sub-7 ({REF}, status {status}" in msg
         assert "one submission per hotkey, ever" in msg and "duplicate_hotkey" in msg and "new hotkey" in msg
+        assert f"a submission in {status} uses it (only invalid, copy and duplicate_hotkey commits leave it free)" in msg
+
+
+def test_commit_goes_ahead_when_no_earlier_commit_used_the_slot(monkeypatch):
+    alice = Keypair.create_from_uri("//Alice")
+    sent = []
+    monkeypatch.setattr(cli, "_keypair", lambda a: alice)
+    monkeypatch.setattr(api_mod.Api, "dev_commit", lambda self, image: sent.append(image) or {"block": 9})
+    rows = [{"hotkey": alice.ss58_address, "id": f"sub-{k}", "image": REF, "status": st, "commit_block": k}
+            for k, st in enumerate(("invalid", "copy", "duplicate_hotkey"))]
+    _api(monkeypatch, _subs(rows))
+    assert cli.main(["commit", "--image", REF, "--no-check", "--dev-api", "http://api"]) == 0 and sent == [REF]
+    rows += [{"hotkey": alice.ss58_address, "id": "sub-8", "image": REF, "status": "abandoned", "commit_block": 8},
+             {"hotkey": alice.ss58_address, "id": "sub-5", "image": REF, "status": "below_king", "commit_block": 5}]
+    with pytest.raises(SystemExit, match="already has submission sub-5 .*status below_king"):
+        cli.main(["commit", "--image", REF, "--no-check", "--dev-api", "http://api"])
+    assert sent == [REF]
 
 
 def test_commit_needs_the_api_check_or_its_opt_out(monkeypatch):
@@ -192,6 +209,8 @@ def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys
     assert out["king"] is False and out["king_best"] == 0.64 and out["margin"] == 0.02
     assert s["phase1"] == {"done": 1000, "total": 1000, "score": 0.71, "successes": None} and s["queue_position"] == 2
     assert "phase 2 queue position 2" in s["verdict"] and "sub-3: phase 1 done: 71.0 %" in cap.err
+    assert out["king_image"] is None and out["king_note"] == "king: no image published"
+    assert "vector-miner: king: no image published" in cap.err
     views = {
         "waiting_connection": ({}, "run vector-miner serve"),
         "phase1": ({"phase1": {"done": 412, "total": 1000}}, "412/1000 scenes"),
@@ -202,19 +221,23 @@ def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys
         "not_crowned": ({"phase1": {"score": 0.71}, "king_run": {"score": 0.7}}, "not crowned"),
         "disqualified": ({"reason": "action hash differs on 3 of 100 scenes"}, "action hash differs on 3 of 100"),
         "abandoned": ({}, "no miner connection within 48 h"),
+        "invalid": ({"reason": "the image is private"}, "the image is private; it did not use this hotkey's submission"),
+        "copy": ({}, "the hotkey may commit again"),
     }
     for st, (extra, want) in views.items():
         rows[HOT] = [{"id": "sub-3", "hotkey": HOT, "status": st, **extra}]
         assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
         s = json.loads(capsys.readouterr().out)["submissions"][0]
         assert want in s["verdict"], (st, s)
-        assert s["final"] == (st in ("below_king", "crowned", "not_crowned", "disqualified", "abandoned"))
+        assert s["final"] == (st in ("below_king", "crowned", "not_crowned", "disqualified", "abandoned", "invalid",
+                                     "copy"))
         if st == "king_run":
             assert s["king_same_scenes"]["done"] == 300
-    king["hotkey"] = HOT
+    king["hotkey"], king["image"] = HOT, REF
     rows[HOT] = []
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     out = json.loads(capsys.readouterr().out)
+    assert out["king_image"] == REF and "king_note" not in out
     assert out["king"] is True and out["submissions"] == [] and "vector-miner commit" in out["note"]
 
 
