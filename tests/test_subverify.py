@@ -343,3 +343,114 @@ def test_the_genesis_king_has_no_image(capsys, env, tmp_path):
     doc["king"]["id"] = "sub-7"
     code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
     assert code == 1 and "king: no image published" in out["document"]["problems"], out["document"]
+
+
+def test_hostile_json_is_refused(capsys, env, tmp_path, monkeypatch):
+    doc = make_doc(fake_env(broken=BROKEN))
+    nan = json.dumps(doc).replace('"margin": 0.02', '"margin": NaN')
+    for text, msg in ((nan, "NaN"), ("[" * 100000 + "]" * 100000, "not JSON"), ("[1, 2]", "not a verify document")):
+        p = tmp_path / "h.json"
+        p.write_text(text)
+        code, out, err = run(capsys, "--submission", SID, "--doc", str(p))
+        assert code == 2 and out is None and msg in err, err
+    monkeypatch.setattr(verify, "MAX_DOC_BYTES", 1000)
+    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc))
+    assert code == 2 and "larger than 1000 bytes" in err
+
+
+def test_api_failures_and_bad_arguments_exit_2(monkeypatch, capsys, env, tmp_path):
+    def handler(kind):
+        def h(req):
+            if kind == "text":
+                return httpx.Response(200, content=b"<html>")
+            if kind == "big":
+                return httpx.Response(200, content=b"x" * 5000)
+            raise httpx.ConnectError("refused", request=req)
+        return h
+    for kind, msg in (("text", "not JSON"), ("big", "larger than 4000 bytes"), ("down", "cannot reach")):
+        monkeypatch.setattr(verify, "MAX_DOC_BYTES", 4000)
+        monkeypatch.setattr(api_mod, "make_client",
+                            lambda timeout, k=kind: httpx.Client(transport=httpx.MockTransport(handler(k))))
+        code, out, err = run(capsys, "--submission", SID, "--api", "http://api")
+        assert code == 2 and out is None and msg in err, (kind, err)
+    monkeypatch.setattr(verify, "MAX_DOC_BYTES", 64 << 20)
+    p = write(tmp_path, make_doc(fake_env(broken=BROKEN)))
+    for argv, msg in ((["--workers", "0"], "--workers"), (["--wall", "-1"], "--wall"), (["--scenes", "-3"], "negative"),
+                      (["--salt-sha256", "abc"], "--salt-sha256"),
+                      (["--save", str(tmp_path / "no" / "x.json")], "cannot write")):
+        code, out, err = run(capsys, "--submission", SID, "--doc", p, *argv)
+        assert code == 2 and out is None and msg in err, (argv, err)
+
+
+class BrokenScenes(Scenes):
+    def generate(self, seed, draw=None):
+        raise RuntimeError("sim.mjs stopped: cannot open the bundle")
+
+
+def test_a_broken_local_setup_is_not_a_mismatch(monkeypatch, capsys, tmp_path):
+    p = write(tmp_path, make_doc(fake_env()))
+    monkeypatch.setattr(verify, "load_env", lambda: SimpleNamespace(scenes=BrokenScenes(), harness=Harness(), wall_s=45.0))
+    code, out, err = run(capsys, "--submission", SID, "--doc", p)
+    assert code == 2 and out is None and "the scene generator does not work here" in err and "MISMATCH" not in err
+
+    def boom():
+        raise verify.VerifyError("vector-env's settings do not load: bad yaml")
+    monkeypatch.setattr(verify, "load_env", boom)
+    code, out, err = run(capsys, "--submission", SID, "--doc", p)
+    assert code == 2 and "settings do not load" in err
+
+
+def test_one_unreproducible_scene_with_a_working_generator_is_a_mismatch(monkeypatch, capsys, tmp_path):
+    doc = make_doc(fake_env())
+    bad = {verify.base_seed(SALT, 0, 6) + k for k in range(6)}
+    monkeypatch.setattr(verify, "load_env", lambda: fake_env(broken=bad))
+    code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc))
+    assert code == 1 and [x["index"] for x in out["scenes"]["mismatched"]] == [6]
+    assert "could not place" in out["scenes"]["mismatched"][0]["error"]
+
+
+def test_a_scene_made_with_another_vector_env_is_unverified_not_a_mismatch(capsys, env, tmp_path):
+    doc = make_doc(fake_env(broken=BROKEN))
+    doc["scenes"][4]["env"] = {**ENV, "version": "0.0.9"}
+    doc["scenes"][4]["state_hash"] = "9" * 16
+    doc["scenes_sha256"] = verify.scenes_digest(doc["scenes"])
+    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc))
+    assert code == 2 and not out["ok"] and out["document"]["ok"] and out["scenes"]["mismatched"] == []
+    assert [x["index"] for x in out["scenes"]["unverified"]] == [doc["scenes"][4]["index"]]
+    assert "another vector-env" in err
+
+
+EXCLUDED = sorted(set(subverify.INFRA) | subverify.CUT_OFF | {subverify.NOT_RUN})
+
+
+def _with_sample(doc, sample):
+    res, pos = doc["phase1"]["results"], {x["index"]: k for k, x in enumerate(doc["scenes"])}
+    doc["phase2"].update(scenes=sample, outcome=[res["outcome"][pos[i]] for i in sample],
+                         action_hash=[res["action_hash"][pos[i]] for i in sample], wall_s=[12.5 for _ in sample])
+    return doc
+
+
+def test_phase1_cut_offs_stay_out_of_the_phase2_sample(capsys, env, tmp_path):
+    doc = make_doc(fake_env(broken=BROKEN), "not_crowned")
+    res, rows = doc["phase1"]["results"], doc["scenes"]
+    pos = {x["index"]: k for k, x in enumerate(rows)}
+    cut = next(i for i in doc["phase2"]["scenes"] if not res["success"][pos[i]])
+    res["outcome"][pos[cut]] = "step_timeout"
+    doc["king"]["results"]["outcome"][pos[cut]] = "step_timeout"
+    doc.update(phase2_scenes=6, excluded_outcomes=EXCLUDED, first_step_deadline_s=10.0)
+    old = list(doc["phase2"]["scenes"])
+    want = _sample([i for i in pos if i != cut])
+    assert cut in old and cut not in want
+    code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, _with_sample(doc, want)), "--hash-scenes", "0")
+    assert code == 0 and out["document"]["ok"], out["document"]
+    for fn, problem in ((lambda d: _with_sample(d, old), "other scenes than the sample rule picks"),
+                        (lambda d: d.update(excluded_outcomes=None) or _with_sample(d, want),
+                         "other scenes than the sample rule picks"),
+                        (lambda d: d.update(phase2_scenes=7), "min(phase2_scenes 7"),
+                        (lambda d: d.update(excluded_outcomes=EXCLUDED + ["missed"]), "leaves missed out"),
+                        (lambda d: d.update(excluded_outcomes="step_timeout"), "excluded_outcomes")):
+        d = copy.deepcopy(doc)
+        fn(d)
+        code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, d), "--hash-scenes", "0")
+        got = (out or {}).get("document", {}).get("problems", []) if out else [err]
+        assert code in (1, 2) and any(problem in p for p in got), (problem, got)

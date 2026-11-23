@@ -185,7 +185,13 @@ flowchart TD
   N --> H["connect, send the signed hello"]
   H --> L["bridge start / act / state / end by scene_key"]
   L -->|"done"| X["exit 0"]
-  L -->|"close 1008 or 4000-4999"| RF["refused: exit 1"]
+  L -->|"done, status review, retry_at"| RA["wait until retry_at"]
+  RA --> N
+  H -->|"4429 busy"| BW["wait retry_after_s (60 s)"]
+  BW --> N
+  H -->|"4403 not_open with retry_at"| RA
+  H -->|"4401 nonce, 4408 timeout"| B
+  H -->|"other 1008 / 4000-4999: signature, image, unknown, replaced, over"| RF["refused: exit 1"]
   L -->|"other close, network error"| K["kill the running scenes' containers"]
   K --> B["wait 1 s, 2 s, 4 s ... 60 s (x 0.5-1)"]
   B --> N
@@ -203,16 +209,33 @@ flowchart TD
 - Your expert sees exactly the `vector-expert/2` lines of a local `eval` (the `scene_key` is removed); what it
   writes goes back with its `scene_key`. A line that is not a JSON object, a line over 1 MiB, or an exit before the
   scene's `end` is sent to the subnet as `{"type":"error"}` for that scene.
-- The subnet waits 2 s for each `act` (the simulator is paused meanwhile); a scene has a wall cap, and phase 1 a
-  total cap. A timeout or a dropped connection is your failure. Containers are started ahead (`--warm N`, default
-  `--concurrency`) so a scene does not wait for `docker run`; `--concurrency N` (default 8, what the subnet sends at
-  once) bounds the scenes running. Keep it at 8: a scene that waits for a free slot spends its 2 s.
+- Deadlines (the simulator is paused while it waits for you):
+
+  | wait | limit | welcome field |
+  |---|---|---|
+  | the first `act`, after `start` | 10 s | `first_step_deadline_s` |
+  | every later `act`, after a `state` | 2 s | `step_deadline_s` |
+  | the whole scene | 45 s | `wall_s` |
+
+  A late act ends the scene as `step_timeout`, a scene over its wall time as `wall_timeout`; both, and a dropped
+  connection, are your failures, and phase 2 leaves those scenes out of its sample. `vector-miner eval` holds your
+  expert to the same deadlines. Containers are started ahead (`--warm N`, default `--concurrency`) so a scene does
+  not wait for `docker run`; `--concurrency N` (default 8, what the subnet sends at once) bounds the scenes running.
+  Keep it at 8: a scene that waits for a free slot spends its first-act time.
 - When the connection drops, the running scenes' containers are killed and `serve` reconnects with backoff
   (1 s doubling to 60 s, times 0.5 to 1); the subnet restarts the unfinished scenes from tick 0, at most twice per
   scene. Keep `serve` running until it prints `done`.
-- `{"type":"welcome"}` and `{"type":"error"}` (without a `scene_key`) from the subnet are printed; `{"type":"done"}`
-  (phase 1 finished) ends `serve` with exit 0. A close with code 1008 or 4000-4999 means the subnet refused the
-  miner (bad signature, no such commit, another connection already serving it): exit 1 with the reason, no retry.
+- `{"type":"welcome"}` (submission, status, `done`/`scenes`, the deadlines) and `{"type":"error"}` without a
+  `scene_key` (its `reason` and `message`) are printed. `{"type":"done"}` (phase 1 finished: status, score,
+  successes/scenes) ends `serve` with exit 0; when its status is `review` with a `retry_at` (scenes failed on the
+  subnet's side), `serve` waits until then and connects again.
+- A refusal is a `{"type":"error", reason, message}` and a close whose reason is `<reason>: <message>`. Not final,
+  `serve` connects again: `4429 busy` after `retry_after_s` (default 60 s); `4403 not_open` with a `retry_at`
+  (phase 1 in review) at that time; `4408 timeout` and `4401` for an unknown or expired nonce with the usual backoff
+  (a nonce refusal at most 5 times in a row). Final, exit 1 with the reason: a bad signature or hello (`4401`), not
+  the committed image (`4403 image`), no submission for the hotkey (`4404`), phase 1 over (`4403 not_open` without
+  `retry_at`), a newer connection of the same submission (`4409 replaced`), a message too big (`4413`), and any
+  other 1008 or 4000-4999 close.
 - Ctrl-C or SIGTERM closes the socket (code 1000) and kills every container: exit 0. `--stderr DIR` keeps each
   container's stderr in `DIR/<container name>.log`; the log names the scene of each container.
 
@@ -226,7 +249,8 @@ One JSON object: `king` (whether you are the king), `king_hotkey`, `king_image` 
 runs as a command: `king_note` then says `king: no image published`), `king_best`, `margin`, and `submissions`, each
 with `id`, `image`, `status`, `committed_at`, `salt_sha256`, `phase1 {done, total, score, successes}`,
 `queue_position` (phase-2 queue, highest phase-1 score first), `phase2`, `king_same_scenes {hotkey, image, done,
-total, score}` (the king's run on your scenes), `reason`, `final` and `verdict` (one line, also printed to stderr).
+total, score}` (the king's run on your scenes), `reason`, `retry_at`, `final` and `verdict` (one line, also printed
+to stderr).
 It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`.
 
 | status | meaning |
@@ -242,6 +266,7 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 | `duplicate_hotkey` | a second commit from a hotkey that already had one; never evaluated |
 | `invalid` / `copy` | a bad commit, the digest of an earlier submission; neither uses the hotkey's submission, so it may commit again |
 | `abandoned` | no connection within 48 h; final, and it used the hotkey's submission |
+| `review` | more than 2 % of a stage's scenes failed on the subnet's side; that stage runs again at `retry_at` (6 h later). Not your expert's fault; in phase 1 keep `serve` running |
 
 ## Commands
 
@@ -249,6 +274,7 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 vector-miner eval (--command "..." | --image REF) [--scenes 20 | --determinism N] [--seed 0] [--workers 1]
                   [--time-limit 15] [--wall 45] [--cpus 4] [--memory 8g] [--docker docker] [--pull] [--results FILE]
                   [--stderr DIR] [--trace DIR] [--scene-cache DIR | --no-scene-cache]
+                  [--first-step-deadline 10] [--step-deadline 2] [--strict] [--determinism N]
 vector-miner commit --image REF --netuid <netuid> [--network finney] [--api URL | --no-api-check]
                     [--wallet.name --wallet.hotkey --wallet.path] [--no-check]
 vector-miner serve --image REF [--api URL] [--concurrency 8] [--warm N] [--command "..."] [--cpus 4] [--memory 8g]
@@ -258,12 +284,18 @@ vector-miner verify --submission ID (--api URL | --doc FILE) [--save FILE] [--ha
                     [--image REF|submission|king [--command "..."] [--scenes 20] [--sample-seed 0] [--workers 1]
                     [--wall S] [--cpus 4] [--memory 8g] [--docker docker] [--pull]] [--salt-sha256 HEX]
                     [--allow-uncommitted]
-vector-miner verify --round N ...            # a weekly round from before v8 (same options)
 ```
 
 `$VECTOR_MINER_API` can hold the API address (`--api`).
 
-- `eval` generates random scenes from `--seed` and runs your expert through the same harness the subnet uses.
+- `eval` generates random scenes from `--seed` and plays them the way phase 1 does: vector-env's remote harness
+  sends the messages through `serve`'s bridge (in-process, no network) to a fresh expert per scene, started ahead
+  like `serve --warm`, and holds every act to the phase-1 deadlines: 10 s for the first act after `start`
+  (`--first-step-deadline`), 2 s for each later one (`--step-deadline`). A late act ends the scene `step_timeout`,
+  as in phase 1. The summary gains `deadlines` (`first_act_max_s`, `first_act_mean_s`, `later_act_max_s`, measured
+  at the bridge; `late_scenes`, `step_timeouts`), a warning lists late acts, and `--strict` makes them exit 1.
+  `--workers N` scenes run at once on this machine, which also runs the simulator: phase 1 runs 8 and the
+  simulator is on the subnet's side, so measure with `--workers 8` on the machine that will `serve`.
   `--command` runs a local program (no docker, no sandbox). `--image` starts a fresh container per scene as
   phase 2 does: `--network none`, read-only root filesystem, `/tmp` in memory (1 GB), user 65534 with `HOME=/tmp`,
   no capabilities, 256 processes, 1024 open files, `--cpus 4 --memory 8g`, 15 s of robot time and 45 s of wall
@@ -350,8 +382,12 @@ flowchart LR
   (infrastructure failures, an `INFRA_OUTCOMES` outcome or none, are left out; `not_run` and timeouts count as
   failures), mean times match the successful scenes; `below_king` needs a phase-1 score not above
   `decision.king_best` + `margin` and no phase 2; any other final status needs one above it and a phase 2 on the
-  sample rule's scenes (the smallest `sha256(f"{salt}:phase2:{index}")` among the phase-1 verdicts with an action
-  hash), each with an outcome, an action hash and a wall time; phase-2 infrastructure failures are left out of the
+  sample rule's scenes: the `phase2_scenes` (100) indexes with the smallest `sha256(f"{salt}:phase2:{index}")`,
+  sorted, among the phase-1 scenes with an action hash and an outcome not in `excluded_outcomes` (the
+  infrastructure outcomes, `not_run` and the cut-offs `step_timeout`, `disconnected`, `wall_timeout`; a document
+  that leaves out any other outcome is a problem; one without the field is read with the older rule, only
+  infrastructure failures and `not_run` left out). Each phase-2 scene has an outcome, an action hash and a wall
+  time; phase-2 infrastructure failures are left out of the
   comparison, and it passes when at least one scene is compared, every hash equals phase 1's and no scene is a
   `wall_timeout` or over `wall_s`; `disqualified` needs a phase 2 that did not pass and a reason; `crowned` and
   `not_crowned` need phase 2 passed and a king run, whose score and `decision.score` are successes on the scenes
@@ -359,90 +395,25 @@ flowchart LR
   Images must be `ghcr.io/<repo>@sha256:<digest>` with their own `digest`; the genesis king (no `id`) runs as a
   command and has no image: a warning `king: no image published`, and `--image king` skips the re-run.
 - `--image` takes `submission`, `king`, or that image's reference, digest or hotkey; it runs the image (or
-  `--command` instead) on `--scenes` scenes with a published verdict, sampled with `--sample-seed`, and reports
+  `--command` instead) on `--scenes` scenes with a published verdict that is not a cut-off, sampled with `--sample-seed`, and reports
   `hash_equal`, `hash_agreement`, `outcome_agreement` and every scene whose action hash differs. A deterministic
   image gives the published hashes on any machine. Re-run differences do not change the exit code.
 - `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched`, `over_wall`, `infra`,
   `passed`; `same_scenes` repeats the decision: `compared`, `score`, `king_score`.
-- Regeneration, `--save`, `--doc`, strict JSON, the size limit and the exit codes are as for a round, below; a
-  `--doc` of another submission, an image that did not run for the submission, or giving both or neither of
-  `--submission` and `--round` exit 2.
-
-## Verify a weekly round (before v8)
-
-Nobody sees a round's scenes before the evaluation: they come from a salt drawn while the round is open and kept
-secret; its `salt_sha256` is shown on the board and in the round view from then on, so the salt cannot be changed
-later to pick favourable scenes. Once the round is final (evaluated, and the crown kept or moved), the API publishes everything needed to check it at
-`GET /v1/skills/bin-picking/expert/rounds/<n>/verify` (404 until then): the salt and its commitment, the vector-env version and asset
-sha256 the scenes were made with, every scene's seed and state hash, and every evaluated image (the king's re-run
-and each challenger, by digest) with its score, rank and per-scene outcome and time.
-
-```mermaid
-flowchart LR
-  CM["salt_sha256 (shown while open)"] --> CK{"sha256(salt) = commitment?"}
-  S["salt (published after the round is final)"] --> CK
-  S --> SD["seed i = sha256(salt:n:i)[:6] + k"]
-  SD --> G["vector-env: generate the scene"]
-  G --> H{"seed and state hash = published?"}
-  D["published results"] --> C{"scores, ranks, crown add up?"}
-  G --> R["--image: run the image on K sampled scenes"]
-  R --> A["agreement with the published outcomes"]
-```
-
-```bash
-.venv/bin/vector-miner verify --round 12 --api https://vector.robotensor.ai
-
-# also re-run the winner on 20 sampled scenes in docker and compare outcomes
-.venv/bin/vector-miner verify --round 12 --api https://vector.robotensor.ai --hash-scenes 100 \
-  --image ghcr.io/<them>/bin-expert@sha256:<digest> --scenes 20 --pull
-
-# also compare the salt with the commitment you noted from the board while the round was open
-.venv/bin/vector-miner verify --round 12 --api https://vector.robotensor.ai --salt-sha256 <64 hex>
-
-# your own program in place of an image (no docker)
-.venv/bin/vector-miner verify --round 12 --api https://vector.robotensor.ai --image <digest> \
-  --command "node example/solve.mjs" --scenes 5
-```
-
-- Seeds: scene `i` of round `n` uses `int.from_bytes(sha256(f"{salt}:{n}:{i}").digest()[:6], "big")`, which is
-  vector-env's `scenes.seed_for(n, i, salt)`, plus `k`: the first `k` below `seed_tries` (6) whose draw places a
-  scene. An index none of whose draws places a scene is listed in `skipped`; a full check (no `--hash-scenes`)
-  also confirms every skipped index fails here. `draw`, `task` and `wall_s` are the round's own settings.
-- The salt: `salt_sha256` must be the sha256 of the published salt, committed (`salt_committed_at`) no later than
-  the close (`closed_at`), and equal to `--salt-sha256` when given, else to the round view's `salt_sha256` when
-  the document comes from `--api`. A null `salt_committed_at` (or `closed_at`) means the document cannot show the
-  salt was fixed before the close: that is a document problem (exit 1). `--allow-uncommitted` lists it under
-  `document.warnings` instead and checks the rest.
-- The document check: the seeds derive from the salt, `scenes_sha256` is
-  `sha256("\n".join(f"{index}:{seed}:{state_hash}"))`, every score is successes / scenes, mean times match the
-  successful scenes, ranks follow score, then mean time, then commit block, and a crown only went to a challenger
-  that beat the king's re-run by more than the margin; a decision that names a king needs that king's image, and
-  the winner is the best-ranked challenger that is not `infra_failed`. Each evaluated `run_image` must be
-  `ghcr.io/<repo>@sha256:<digest>` with the image's own `digest`; otherwise it is a document problem and `--image`
-  does not run (or pull) it.
-- Images that did not finish are listed under `unfinished`: status `stopped` or `infra_failed`, `stop_reason`,
-  how many scenes are `not_run`, `infra_failures`. A re-run skips the image's `not_run` scenes.
-- An image without a published `run_image` is listed under `not_rerunnable`; the genesis king (the team's expert,
-  run as a command, `team: true`) shows as "team expert (not publicly re-runnable)". Its scenes, scores and the
-  decision are still checked; `--image` on it needs `--command`.
 - The document is read as strict JSON (no NaN), at most 64 MB, and every field is type-checked first.
-- Regeneration needs the same vector-env version and asset bundle as the round (`env` in the document, or a
+- Regeneration needs the same vector-env version and asset bundle as the submission (`env` in the document, or a
   scene's own `env` when it was made with another one); with another one, the output warns, and a scene whose
   hash differs is listed under `unverified` (not as a mismatch). When the generator fails on every scene, including
   a known published one (no node, a missing or broken asset bundle), the check stops with exit 2.
-- `--image` takes an evaluated image's reference, digest or hotkey. It runs that image's published `run_image` (the
-  reference the round ran) on `--scenes` scenes sampled with `--sample-seed`, or `--command` instead, and reports
-  `agreement` (same success), `outcome_agreement`, the time difference and every disagreeing scene. A different
-  machine can change a few borderline outcomes; the published results are what the round decided on.
-  `--wall` defaults to the round's `wall_s` (else vector-env's `harness.wall_s`).
 - `--save FILE` keeps the document; `--doc FILE` checks a saved one offline. The output is one JSON object.
-  Exit codes: 0 = the document adds up and every regenerated scene matches; 1 = a document problem (a round
-  without a salt commitment time included, unless `--allow-uncommitted`) or a scene mismatch (listed in the output); 2 = cannot check: a bad argument (`--command` without `--image`, no `--api`
-  without `--doc`, a `--doc` that is unreadable or of another round, `--workers` below 1, a malformed
-  `--salt-sha256`), a malformed, non-JSON or oversized document, the round is not final (404) or the API failed,
-  the image was not evaluated in the round, vector-env is missing or its generator does not work here, the pull
-  failed or the re-run could not run (docker missing, every scene an infra outcome), or scenes are `unverified`
-  (the output is printed). Re-run disagreements are reported under `rerun` and do not change the exit code.
+  Exit codes: 0 = the document adds up and every regenerated scene matches; 1 = a document problem (no salt
+  commitment time included, unless `--allow-uncommitted`) or a scene mismatch (listed in the output); 2 = cannot
+  check: a bad argument (no `--submission`, `--command` without `--image`, no `--api` without `--doc`, a `--doc`
+  that is unreadable or of another submission, `--workers` below 1, a malformed `--salt-sha256`), a malformed,
+  non-JSON or oversized document, the submission is not final (404) or the API failed, an image that did not run
+  for the submission, vector-env is missing or its generator does not work here, the pull failed or the re-run
+  could not run (docker missing, every scene an infra outcome), or scenes are `unverified` (the output is printed).
+  Re-run differences are reported under `rerun` and do not change the exit code.
 
 The example image (`example/Dockerfile`) runs as user 65534 with `HOME=/tmp` and writes nothing outside `/tmp`.
 Files your image reads must be readable by that user.

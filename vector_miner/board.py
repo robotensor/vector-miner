@@ -63,6 +63,13 @@ def verdict(s: dict, king: dict, margin: float | None) -> str:
     if st == "copy":
         return (f"a copy of an earlier submission: {why or 'the same image digest'}; it did not use this hotkey's "
                 "submission, the hotkey may commit again")
+    if st == "review":
+        at = s.get("retry_at")
+        line = "review: being re-run because of a problem on our side, not your expert's"
+        line += f"; it runs again at {at}" if at else "; it runs again automatically"
+        if not s.get("phase2") and not s.get("king_run"):
+            line += "; keep vector-miner serve running so phase 1 can finish"
+        return line
     if st == "abandoned":
         return "abandoned: no miner connection within 48 h of the commit; final"
     return f"status {st}"
@@ -72,7 +79,8 @@ def view(s: dict, king: dict, margin: float | None) -> dict:
     return {"id": s.get("id"), "image": s.get("image"), "status": s.get("status"),
             "committed_at": s.get("committed_at"), "salt_sha256": s.get("salt_sha256"), "phase1": phase1(s),
             "queue_position": s.get("queue_position"), "phase2": s.get("phase2"), "king_same_scenes": king_same(s),
-            "reason": s.get("reason"), "final": s.get("status") in FINAL, "verdict": verdict(s, king, margin)}
+            "reason": s.get("reason"), "retry_at": s.get("retry_at"), "final": s.get("status") in FINAL,
+            "verdict": verdict(s, king, margin)}
 
 
 def status(api, hotkey: str) -> dict:

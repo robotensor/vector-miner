@@ -21,6 +21,7 @@ FINAL = ("below_king", "crowned", "not_crowned", "disqualified")
 HASH = re.compile(r"^[0-9a-f]{16}$")
 INFRA = frozenset(INFRA_OUTCOMES)
 NOT_RUN = "not_run"
+CUT_OFF = frozenset({"step_timeout", "disconnected", "wall_timeout"})
 GENESIS_KING = "king: no image published"
 
 
@@ -79,8 +80,11 @@ def validate(doc: dict) -> None:
         _int(x, f"skipped[{k}]", 0, 2 * MAX_SCENES)
     _obj(doc.get("draw"), "draw")
     _num(_obj(doc.get("task"), "task").get("time_limit_s"), "task.time_limit_s")
-    for k in ("wall_s", "margin", "step_deadline_s"):
+    for k in ("wall_s", "margin", "step_deadline_s", "first_step_deadline_s"):
         _num(doc.get(k), k)
+    _int(doc.get("phase2_scenes"), "phase2_scenes", 0, MAX_SCENES, null=True)
+    for j, v in enumerate(_arr(doc.get("excluded_outcomes"), "excluded_outcomes", 256, null=True)):
+        _str(v, f"excluded_outcomes[{j}]", 64, null=False)
     _env(doc.get("env"), "env")
     for k, x in enumerate(_arr(doc.get("scenes"), "scenes", MAX_SCENES)):
         w = f"scenes[{k}]"
@@ -256,17 +260,37 @@ def phase2_check(doc: dict) -> dict | None:
             "status": p2.get("status"), "reason": p2.get("reason")}
 
 
+def excluded(doc: dict) -> frozenset:
+    got = doc.get("excluded_outcomes")
+    return frozenset(got) | {NOT_RUN} if isinstance(got, list) else frozenset({NOT_RUN})
+
+
+def _excluded_problems(doc: dict) -> list[str]:
+    got = doc.get("excluded_outcomes")
+    if not isinstance(got, list):
+        return []
+    extra = sorted(set(got) - INFRA - CUT_OFF - {NOT_RUN})
+    if extra:
+        return [f"excluded_outcomes leaves {', '.join(extra)} out of the phase-2 sample; the rule leaves out only "
+                f"infrastructure failures, {NOT_RUN} and the cut-offs ({', '.join(sorted(CUT_OFF))})"]
+    return []
+
+
 def _sample_problems(doc: dict, p2: dict) -> list[str]:
     res, rows = doc["phase1"]["results"], doc["scenes"]
     if len(res.get("action_hash") or []) != len(rows) or len(res.get("outcome") or []) != len(rows):
         return []
+    out = excluded(doc)
     ok = [x["index"] for k, x in enumerate(rows)
-          if res["action_hash"][k] and res["outcome"][k] != NOT_RUN and _verdict(res, k)]
+          if res["action_hash"][k] and res["outcome"][k] not in out and _verdict(res, k)]
     got = doc["phase2"].get("scenes") or []
-    want = phase2_sample(doc["salt"], ok, len(got))
+    k = doc.get("phase2_scenes")
+    want = phase2_sample(doc["salt"], ok, len(got) if k is None else k)
     if got != want:
-        return [f"phase 2 ran on other scenes than the sample rule picks from the {len(ok)} phase-1 verdicts "
-                f"(the {len(got)} smallest sha256(salt:phase2:index), sorted: {want[:10]})"]
+        size = f"{len(want)} = min(phase2_scenes {k}, {len(ok)})" if k is not None else str(len(got))
+        left = f", leaving out {', '.join(sorted(out))}" if doc.get("excluded_outcomes") is not None else ""
+        return [f"phase 2 ran on other scenes than the sample rule picks from the {len(ok)} eligible phase-1 "
+                f"scenes{left} (the {size} smallest sha256(salt:phase2:index), sorted: {want[:10]})"]
     return []
 
 
@@ -330,6 +354,7 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
         bad.append(f"the scene list does not hold indexes 0..{count + len(skip) - 1}"
                    + (" less the skipped ones" if skip else ""))
     bad += _salt_problems(doc, salt_sha256, salt_source, allow_uncommitted, warnings)
+    bad += _excluded_problems(doc)
     if scenes_digest(rows) != doc.get("scenes_sha256"):
         bad.append("scenes_sha256 does not match the scene list")
     for x in rows:
@@ -496,7 +521,8 @@ def verify(doc: dict, *, e=None, hash_scenes: int | None = None, image: str | No
     if who is not None:
         res, pos = who.get("results") or doc["phase1"]["results"], {x["index"]: k for k, x in enumerate(doc["scenes"])}
         n = min(len(res.get(k) or []) for k in ("success", "outcome", "action_hash"))
-        ran = [i for i in order if pos[i] < n and res["action_hash"][pos[i]] is not None and _verdict(res, pos[i])]
+        ran = [i for i in order if pos[i] < n and res["action_hash"][pos[i]] is not None and _verdict(res, pos[i])
+               and res["outcome"][pos[i]] not in CUT_OFF]
         pick_idx = ran[:max(0, int(rerun_scenes))]
     m = count if hash_scenes is None else min(count, max(0, int(hash_scenes)))
     g = rv.regenerate(doc, e, sorted(set(order[:m]) | set(pick_idx)), log=log, local=local,
