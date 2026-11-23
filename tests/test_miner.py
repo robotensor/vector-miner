@@ -173,8 +173,16 @@ def test_status_and_commit_without_a_wallet(tmp_path):
         with pytest.raises(SystemExit) as e:
             cli.main([*argv, "--wallet.path", str(tmp_path), "--wallet.name", "miner"])
         msg = str(e.value.code)
-        assert msg.startswith("vector-miner: no wallet hotkey miner/default in ") and "btcli wallet new_hotkey" in msg
-        assert ("--hotkey" in msg) == (argv[0] == "status")
+        assert msg.startswith("vector-miner: no wallet hotkey miner/default in ")
+        assert f".venv/bin/btcli wallet new-coldkey --wallet miner --wallet-path {tmp_path}, then " in msg
+        assert msg.endswith(f".venv/bin/btcli wallet new-hotkey --wallet miner --wallet-hotkey default --wallet-path {tmp_path}")
+        assert "new_" not in msg and "--wallet.name/--wallet.hotkey" in msg
+        assert ("--hotkey <ss58>" in msg) == (argv[0] == "status")
+    (tmp_path / "miner").mkdir()
+    (tmp_path / "miner" / "coldkeypub.txt").write_text("{}")
+    msg = cli.btcli_create("miner", "hk", str(tmp_path))
+    assert msg == f".venv/bin/btcli wallet new-hotkey --wallet miner --wallet-hotkey hk --wallet-path {tmp_path}"
+    assert cli.btcli_create("nobody-x", "hk", cli.DEFAULT_WALLETS).endswith("new-hotkey --wallet nobody-x --wallet-hotkey hk")
 
 
 def test_status_unreachable_api_is_one_line(monkeypatch, capsys):
@@ -189,7 +197,7 @@ def _no_docker_scenes(monkeypatch):
     from vector_env import cli as env_cli
     scs = [{"scene_id": f"s{i}-0000000{i}", "seed": i, "xml": "<mujoco/>", "meta": {"parts": [1]}, "checkpoint": "",
             "state_hash": str(i) * 8, "target": 1} for i in range(3)]
-    monkeypatch.setattr(env_cli, "draw_scenes", lambda n, seed, draw=None, log=None: (scs[:n], []))
+    monkeypatch.setattr(env_cli, "draw_scenes", lambda n, seed, draw=None, log=None, **k: (scs[:n], []))
 
 
 def test_eval_image_without_docker_is_an_infra_error(monkeypatch, capsys, tmp_path):
@@ -225,3 +233,58 @@ def test_eval_skips_like_the_round(monkeypatch, capsys):
     cap = capsys.readouterr()
     out = json.loads(cap.out)
     assert out["skipped"] == [0] and out["scenes"] == 2 and out["score"] == 1.0 and "Traceback" not in cap.err
+
+
+def test_eval_passes_trace_and_scene_cache(monkeypatch, capsys, tmp_path):
+    from vector_env import cli as env_cli
+    seen = {}
+
+    def evaluate(expert, n, seed, **k):
+        seen.update(k)
+        raise env_cli.EvalError("stop here")
+    monkeypatch.setattr(env_cli, "evaluate", evaluate)
+    assert cli.main(["eval", "--command", "true", "--trace", str(tmp_path / "t"), "--scene-cache", str(tmp_path / "c"),
+                     "--stderr", str(tmp_path / "e"), "--workers", "3"]) == 2
+    assert seen["trace_dir"] == str(tmp_path / "t") and seen["scene_cache_dir"] == str(tmp_path / "c")
+    assert seen["stderr_dir"] == str(tmp_path / "e") and seen["workers"] == 3
+    assert capsys.readouterr().err.strip() == "vector-miner: stop here"
+    assert cli.main(["eval", "--command", "true", "--no-scene-cache"]) == 2
+    assert seen["scene_cache_dir"] is False and seen["trace_dir"] is None
+
+
+def _bin(d, name, body):
+    p = d / name
+    p.write_text("#!/usr/bin/env bash\n" + body)
+    p.chmod(0o755)
+
+
+def test_setup_pins_vector_env_and_vector_sim(tmp_path):
+    import os
+    import re
+    import shutil
+    import subprocess
+    root = HERE.parent
+    repo = tmp_path / "vector-miner"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "example").mkdir()
+    for f in ("scripts/setup.sh", "example/Dockerfile", "pyproject.toml"):
+        shutil.copy(root / f, repo / f)
+    env_ver = re.search(r'"vector-env==([^"]+)"', (root / "pyproject.toml").read_text()).group(1)
+    sim_ref = re.search(r"^ARG VECTOR_SIM_REF=(\S+)", (root / "example" / "Dockerfile").read_text(), re.M).group(1)
+    assert (env_ver, sim_ref) == ("0.1.0", "v0.1.0")
+    bin_, log = tmp_path / "bin", tmp_path / "calls.log"
+    bin_.mkdir()
+    fake_env_setup = f'echo "env-setup VECTOR_SIM_REF=$VECTOR_SIM_REF VECTOR_ENV_JS_ONLY=$VECTOR_ENV_JS_ONLY" >> {log}\n'
+    _bin(bin_, "git", f'echo "git $@" >> {log}\nif [ "$1" = clone ]; then d="${{@: -1}}"; mkdir -p "$d/vector_env" "$d/scripts"; '
+                      f"printf '%s\\n' '#!/usr/bin/env bash' '{fake_env_setup.strip()}' > \"$d/scripts/setup.sh\"; "
+                      'chmod +x "$d/scripts/setup.sh"; exit 0; fi\nexit 1\n')
+    _bin(bin_, "uv", "exit 0\n")
+    _bin(bin_, "npm", "exit 0\n")
+    env = {k: v for k, v in os.environ.items() if k not in ("VECTOR_ENV_REF", "VECTOR_SIM_REF", "VECTOR_ENV_DIR")}
+    env["PATH"] = f"{bin_}:{env['PATH']}"
+    p = subprocess.run(["bash", str(repo / "scripts" / "setup.sh")], env=env, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    calls = log.read_text().splitlines()
+    assert calls[0].startswith(f"git clone --depth 1 --branch v{env_ver} ") and calls[0].endswith("../vector-env")
+    assert f"env-setup VECTOR_SIM_REF={sim_ref} VECTOR_ENV_JS_ONLY=1" in calls
+    assert f"at {sim_ref}" in p.stderr and "assets: not installed yet" in p.stderr

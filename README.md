@@ -24,13 +24,19 @@ git clone https://github.com/robotensor/vector-miner && cd vector-miner
 scripts/setup.sh            # clones vector-env and vector-sim next to this folder if missing, .venv, npm ci
 ```
 
+`setup.sh` clones vector-env at the tag of the version this package pins (`vector-env==0.1.0` in `pyproject.toml`:
+`v0.1.0`) and vector-sim at `ARG VECTOR_SIM_REF=` of `example/Dockerfile` (`v0.1.0`), the simulator the example
+image and the round's harness run. Checkouts already there are kept; one at another commit gets a warning with the
+`git checkout` that fixes it. `VECTOR_ENV_REF` and `VECTOR_SIM_REF` override the pins (a tag, a branch or a sha).
 `VECTOR_ENV_DIR=<folder>` uses (or clones) vector-env there instead of `../vector-env`. The example's
 `@vector/sim` is `file:../../vector-sim/js`, so when vector-sim sits beside that other folder `setup.sh` links it to
 `../vector-sim`.
 
 Python 3.12 (`requires-python >=3.12`, `.python-version`), Node 22 or newer (`.nvmrc`: 24), git and docker.
 `setup.sh` uses `uv` when it is installed, else `python3 -m venv`, and installs `requirements.lock` (every package
-pinned with its hashes, the Bittensor SDK included) with `--require-hashes`.
+pinned with its hashes, the Bittensor SDK included) with `--require-hashes`. The commands then live in the project's
+`.venv`: `.venv/bin/vector-miner`, `.venv/bin/vector-env` and `.venv/bin/btcli` (Bittensor CLI 11), or all three by
+name after `source .venv/bin/activate`. Nothing needs a separate `pip install`.
 
 ### The asset bundle
 
@@ -64,30 +70,53 @@ docker push ghcr.io/<you>/bin-expert:dev
 # 4. the digest
 docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/<you>/bin-expert:dev    # ghcr.io/<you>/bin-expert@sha256:<digest>
 
-# 5. register your hotkey on the subnet (once; a commit from a hotkey without a uid is invalid)
-btcli subnet register --netuid <netuid> --wallet.name <coldkey> --wallet.hotkey <hotkey>
+# 5. a wallet, and its hotkey registered on the subnet (once; read "Wallet and registration" first)
+.venv/bin/btcli wallet new-coldkey --wallet <coldkey>
+.venv/bin/btcli wallet new-hotkey --wallet <coldkey> --wallet-hotkey <hotkey>
+.venv/bin/btcli subnet burn-cost <netuid>
+.venv/bin/btcli subnet register --netuid <netuid> --wallet <coldkey> --wallet-hotkey <hotkey>
 
-# 6. commit, while a round is open
+# 6. optional: a trial commit on testnet (test TAO, never entered in a mainnet round)
+.venv/bin/btcli subnet register --network test --netuid <test-netuid> --wallet <coldkey> --wallet-hotkey <hotkey>
+.venv/bin/vector-miner commit --network test --netuid <test-netuid> \
+  --image ghcr.io/<you>/bin-expert@sha256:<digest> --wallet.name <coldkey> --wallet.hotkey <hotkey>
+
+# 7. commit, while a round is open
 .venv/bin/vector-miner commit --image ghcr.io/<you>/bin-expert@sha256:<digest> --netuid <netuid> \
   --wallet.name <coldkey> --wallet.hotkey <hotkey>
 
-# 7. follow it
+# 8. follow it
 .venv/bin/vector-miner status --api https://vector.robotensor.ai --wallet.name <coldkey> --wallet.hotkey <hotkey>
 ```
 
-`<netuid>` is published with the subnet. `btcli` comes with the Bittensor CLI (`pip install bittensor-cli`), not
-with this package.
+`<netuid>` and `<test-netuid>` are published with the subnet.
+
+### Wallet and registration
+
+- `btcli` 11 (in `.venv`) names the wallet with `--wallet <coldkey>` and `--wallet-hotkey <hotkey>`;
+  `vector-miner` takes `--wallet.name <coldkey>`, `--wallet.hotkey <hotkey>` and `--wallet.path`. Both read
+  `~/.bittensor/wallets`. The coldkey holds your TAO and pays the registration: keep it encrypted and its recovery
+  phrase offline. The hotkey signs your commits and is what gets a uid on the subnet.
+- Registration costs TAO (burned, the price moves with demand: `subnet burn-cost` shows it, the confirmation prompt
+  shows it again) or, when the subnet allows it, a proof of work (`subnet register --pow`). It is not refunded.
+- A full subnet gives each new registration the uid with the lowest emission among those past their immunity period.
+  Only the king earns, so a hotkey without the crown can lose its uid and must register (and pay) again. Check before
+  every commit that it still has one (`.venv/bin/btcli wallet overview --netuid <netuid> --wallet <coldkey>`): a
+  commit from a hotkey without a uid is invalid.
+- The testnet trial runs the same checks and sends the same signed call; `{"ok": true, ...}` there means the
+  wallet, the reference and the setup work. Testnet registration uses test TAO, which has no value.
 
 ## Commands
 
 ```bash
 vector-miner eval (--command "..." | --image REF) [--scenes 20] [--seed 0] [--workers 1] [--time-limit 15] [--wall 45]
-                  [--cpus 4] [--memory 8g] [--docker docker] [--pull] [--results FILE]
+                  [--cpus 4] [--memory 8g] [--docker docker] [--pull] [--results FILE] [--stderr DIR]
+                  [--trace DIR] [--scene-cache DIR | --no-scene-cache]
 vector-miner commit --image REF --netuid <netuid> [--network finney] [--wallet.name --wallet.hotkey --wallet.path] [--no-check]
 vector-miner status --api https://vector.robotensor.ai [--hotkey <ss58>] [--rounds 3] [--wallet.name --wallet.hotkey]
 vector-miner verify --round N (--api https://vector.robotensor.ai | --doc FILE) [--save FILE] [--hash-scenes M]
                     [--image REF [--command "..."] [--scenes 20] [--sample-seed 0] [--workers 1] [--wall S]
-                    [--cpus 4] [--memory 8g] [--docker docker] [--pull]]
+                    [--cpus 4] [--memory 8g] [--docker docker] [--pull]] [--salt-sha256 HEX] [--allow-uncommitted]
 ```
 
 - `eval` generates random scenes from `--seed` and runs your expert through the same harness the subnet uses.
@@ -95,8 +124,14 @@ vector-miner verify --round N (--api https://vector.robotensor.ai | --doc FILE) 
   round does: `--network none`, read-only root filesystem, `/tmp` in memory (1 GB), user 65534 with `HOME=/tmp`,
   no capabilities, 256 processes, 1024 open files, `--cpus 4 --memory 8g`, 15 s of robot time and 45 s of wall
   time per scene. The image must already be local (`--pull` pulls it first). `--results` writes one JSON line per
-  scene. Change the limits only to experiment: the round uses the defaults. Without an asset bundle (see
-  vector-env) `eval` prints the reason and exits 2.
+  scene; `--stderr DIR` writes your expert's stderr of every scene to `DIR/<index, 4 digits>-<scene_id>.log`
+  (e.g. `0000-s121011998878783-4a5b69a2.log`); `--trace DIR` writes a per-tick trace of every scene (below).
+  Change the limits only to experiment: the round uses the defaults. Without an asset bundle (see vector-env)
+  `eval` prints the reason and exits 2.
+- Generating a scene takes about 2 s. `--workers N` generates (and runs) N scenes at a time, and generated scenes
+  are kept in `~/.cache/vector-env/scenes` (per vector-env version, asset sha256, draw, seed and index), so the
+  next `eval` with the same `--seed` reuses them: compare variants of your expert on the same seed.
+  `--scene-cache DIR` (or `VECTOR_ENV_SCENE_CACHE`) moves the cache, `--no-scene-cache` turns it off.
 - `commit` applies the subnet's checks before it sends anything: the reference is
   `<registry>/<repo>@sha256:<64 hex>` (lower case, no tag), at most 128 characters, and the registry is `ghcr.io`.
   It then asks the registry anonymously for that digest, as the subnet does: a private image, an unknown digest or
@@ -107,6 +142,21 @@ vector-miner verify --round N (--api https://vector.robotensor.ai | --doc FILE) 
 - The image must be public on `ghcr.io` and pinned by digest; one submission per hotkey per round (the latest
   commit before the close). The same digest as an earlier submission is a copy. An invalid commit is not retried:
   fix the cause and commit again.
+
+### Inspect a failure
+
+```bash
+.venv/bin/vector-miner eval --command "node example/solve.mjs" --scenes 30 --seed 1 --workers 4 \
+  --results r.jsonl --trace traces --stderr logs
+#   why s27260578352828-f7734b96: timed_out at tick 300 (15 s): 15 s | ... | the target was held for 18 ticks
+#   (ticks 52-69); it was not held from tick 70 | its lowest point got to 202.3 mm below the lift line ...
+.venv/bin/vector-env scene --seed 27260578352828 > scene.json
+.venv/bin/vector-env replay --scene scene.json --result r.jsonl --trace one.json
+```
+
+Each failed scene gets a `why` line. `traces/<index>-<scene_id>.json` holds, per tick, the row stepped, the joints,
+the grip, the tcp pose, the parts held and touched and the target's height against the lift line, plus `reasons`
+and a `summary`; vector-env's README lists every field. The scene's seed is the number after `s` in its id.
 
 ## Verify a round
 
@@ -151,7 +201,9 @@ flowchart LR
   also confirms every skipped index fails here. `draw`, `task` and `wall_s` are the round's own settings.
 - The salt: `salt_sha256` must be the sha256 of the published salt, committed (`salt_committed_at`) no later than
   the close (`closed_at`), and equal to `--salt-sha256` when given, else to the round view's `salt_sha256` when
-  the document comes from `--api`.
+  the document comes from `--api`. A null `salt_committed_at` (or `closed_at`) means the document cannot show the
+  salt was fixed before the close: that is a document problem (exit 1). `--allow-uncommitted` lists it under
+  `document.warnings` instead and checks the rest.
 - The document check: the seeds derive from the salt, `scenes_sha256` is
   `sha256("\n".join(f"{index}:{seed}:{state_hash}"))`, every score is successes / scenes, mean times match the
   successful scenes, ranks follow score, then mean time, then commit block, and a crown only went to a challenger
@@ -175,8 +227,8 @@ flowchart LR
   machine can change a few borderline outcomes; the published results are what the round decided on.
   `--wall` defaults to the round's `wall_s` (else vector-env's `harness.wall_s`).
 - `--save FILE` keeps the document; `--doc FILE` checks a saved one offline. The output is one JSON object.
-  Exit codes: 0 = the document adds up and every regenerated scene matches; 1 = a document problem or a scene
-  mismatch (listed in the output); 2 = cannot check: a bad argument (`--command` without `--image`, no `--api`
+  Exit codes: 0 = the document adds up and every regenerated scene matches; 1 = a document problem (a round
+  without a salt commitment time included, unless `--allow-uncommitted`) or a scene mismatch (listed in the output); 2 = cannot check: a bad argument (`--command` without `--image`, no `--api`
   without `--doc`, a `--doc` that is unreadable or of another round, `--workers` below 1, a malformed
   `--salt-sha256`), a malformed, non-JSON or oversized document, the round is not final (404) or the API failed,
   the image was not evaluated in the round, vector-env is missing or its generator does not work here, the pull

@@ -228,7 +228,12 @@ def not_rerunnable(doc: dict) -> list[dict]:
             for im in doc.get("images") or [] if not im.get("run_image")]
 
 
-def _salt_problems(doc: dict, expect: str | None, source: str) -> list[str]:
+UNCOMMITTED = ("the round has no salt commitment time (salt_committed_at is null): nothing shows the salt was "
+               "fixed before the round closed")
+
+
+def _salt_problems(doc: dict, expect: str | None, source: str, allow_uncommitted: bool = False,
+                   warnings: list | None = None) -> list[str]:
     bad, have = [], doc.get("salt_sha256")
     if not have:
         bad.append("the document has no salt_sha256: nothing shows the salt was fixed before the round closed")
@@ -237,7 +242,13 @@ def _salt_problems(doc: dict, expect: str | None, source: str) -> list[str]:
     if expect and have != expect:
         bad.append(f"salt_sha256 {have} is not the commitment {source} ({expect})")
     at, closed = doc.get("salt_committed_at"), doc.get("closed_at")
-    if at and closed:
+    if not at or not closed:
+        why = UNCOMMITTED if not at else "the document has no closed_at: the salt commitment time cannot be checked"
+        if not allow_uncommitted:
+            bad.append(why + "; --allow-uncommitted checks the rest")
+        elif warnings is not None:
+            warnings.append(why + " (--allow-uncommitted)")
+    else:
         a, c = dt.datetime.fromisoformat(at), dt.datetime.fromisoformat(closed)
         a, c = (x if x.tzinfo else x.replace(tzinfo=dt.timezone.utc) for x in (a, c))
         if a > c:
@@ -245,7 +256,8 @@ def _salt_problems(doc: dict, expect: str | None, source: str) -> list[str]:
     return bad
 
 
-def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str = "you gave") -> list[str]:
+def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str = "you gave",
+                   allow_uncommitted: bool = False, warnings: list | None = None) -> list[str]:
     if doc.get("format") != FORMAT:
         return [f"unknown document format {doc.get('format')!r} (this vector-miner reads {FORMAT})"]
     validate(doc)
@@ -259,7 +271,7 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
     if len(rows) != count or sorted(idx + skip) != list(range(count + len(skip))):
         bad.append(f"the scene list does not hold indexes 0..{count + len(skip) - 1}"
                    + (" less the skipped ones" if skip else ""))
-    bad += _salt_problems(doc, salt_sha256, salt_source)
+    bad += _salt_problems(doc, salt_sha256, salt_source, allow_uncommitted, warnings)
     if scenes_digest(rows) != doc.get("scenes_sha256"):
         bad.append("scenes_sha256 does not match the scene list")
     for x in rows:
@@ -470,10 +482,14 @@ def rerun(doc: dict, im: dict, expert: dict, scenes: dict, e: SimpleNamespace, *
 def verify(doc: dict, *, e: SimpleNamespace | None = None, hash_scenes: int | None = None, image: str | None = None,
            expert: dict | None = None, rerun_scenes: int = 20, sample_seed: int = 0, wall_s: float | None = None,
            workers: int = 1, docker: dict | None = None, salt_sha256: str | None = None,
-           salt_source: str = "you gave", pull: bool = False, log=_log) -> dict:
-    problems = check_document(doc, salt_sha256=salt_sha256, salt_source=salt_source)
+           salt_source: str = "you gave", pull: bool = False, allow_uncommitted: bool = False, log=_log) -> dict:
+    warnings: list[str] = []
+    problems = check_document(doc, salt_sha256=salt_sha256, salt_source=salt_source,
+                              allow_uncommitted=allow_uncommitted, warnings=warnings)
     out = {"round": doc.get("round"), "salt": doc.get("salt"), "scene_count": doc.get("scene_count"),
-           "document": {"ok": not problems, "problems": problems}}
+           "document": {"ok": not problems, "problems": problems, "warnings": warnings}}
+    for w in warnings:
+        log(f"warning: {w}")
     if problems and doc.get("format") != FORMAT:
         out["ok"] = False
         return out

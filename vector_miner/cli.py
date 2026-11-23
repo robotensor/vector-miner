@@ -10,6 +10,16 @@ import sys
 from .protocol import BadImage, parse_image
 
 
+DEFAULT_WALLETS = os.path.expanduser("~/.bittensor/wallets")
+
+
+def btcli_create(name: str, hotkey: str, path: str) -> str:
+    where = "" if os.path.abspath(os.path.expanduser(path)) == os.path.abspath(DEFAULT_WALLETS) else f" --wallet-path {path}"
+    have_cold = any(os.path.exists(os.path.join(os.path.expanduser(path), name, f)) for f in ("coldkey", "coldkeypub.txt"))
+    cold = "" if have_cold else f".venv/bin/btcli wallet new-coldkey --wallet {name}{where}, then "
+    return f"{cold}.venv/bin/btcli wallet new-hotkey --wallet {name} --wallet-hotkey {hotkey}{where}"
+
+
 def _keypair(a, alt: str = ""):
     from bittensor_wallet import Wallet
     from bittensor_wallet.errors import KeyFileError
@@ -18,8 +28,8 @@ def _keypair(a, alt: str = ""):
         return w.hotkey
     except KeyFileError:
         raise SystemExit(f"vector-miner: no wallet hotkey {a.wallet_name}/{a.wallet_hotkey} in {a.wallet_path}: "
-                         f"{alt}pass --wallet.name/--wallet.hotkey (and --wallet.path), or create one with "
-                         f"btcli wallet new_coldkey and btcli wallet new_hotkey") from None
+                         f"{alt}pass --wallet.name/--wallet.hotkey (and --wallet.path), or create it with "
+                         f"{btcli_create(a.wallet_name, a.wallet_hotkey, a.wallet_path)}") from None
 
 
 def cmd_commit(a) -> int:
@@ -89,7 +99,8 @@ def cmd_eval(a) -> int:
     from vector_env.assets import AssetsError
     try:
         r = evaluate(expert, a.scenes, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall, docker=docker,
-                     stderr_dir=a.stderr)
+                     stderr_dir=a.stderr, trace_dir=a.trace,
+                     scene_cache_dir=False if a.no_scene_cache else a.scene_cache)
     except (AssetsError, EvalError, SceneError, SimError, harness.HarnessError, ValueError) as e:
         print(f"vector-miner: {e}", file=sys.stderr)
         return 2
@@ -169,7 +180,8 @@ def _verify(a) -> int:
         docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
         out = vf.verify(doc, hash_scenes=a.hash_scenes, image=a.image, expert=expert, rerun_scenes=a.scenes,
                         sample_seed=a.sample_seed, wall_s=a.wall, workers=a.workers, docker=docker,
-                        salt_sha256=salt_expect, salt_source=salt_source, pull=a.pull)
+                        salt_sha256=salt_expect, salt_source=salt_source, pull=a.pull,
+                        allow_uncommitted=a.allow_uncommitted)
     except vf.VerifyError as e:
         return bad(str(e))
     print(json.dumps(out, indent=1))
@@ -189,7 +201,7 @@ def main(argv=None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--wallet.name", dest="wallet_name", default="default")
     common.add_argument("--wallet.hotkey", dest="wallet_hotkey", default="default")
-    common.add_argument("--wallet.path", dest="wallet_path", default=os.path.expanduser("~/.bittensor/wallets"))
+    common.add_argument("--wallet.path", dest="wallet_path", default=DEFAULT_WALLETS)
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("commit", parents=[common], help="commit your image on chain")
     c.add_argument("--image", required=True)
@@ -214,7 +226,12 @@ def main(argv=None) -> int:
     e.add_argument("--docker", help="the docker binary")
     e.add_argument("--pull", action="store_true")
     e.add_argument("--results", help="write the per-scene results here (JSON lines)")
-    e.add_argument("--stderr", metavar="DIR", help="write the expert's stderr of every scene to DIR/<index>-<scene_id>.log")
+    e.add_argument("--stderr", metavar="DIR", help="write the expert's stderr of every scene to DIR/<index, 4 digits>-<scene_id>.log")
+    e.add_argument("--trace", metavar="DIR", help="after the run, replay every scene and write DIR/<index, 4 digits>-<scene_id>.json "
+                   "(per tick: row, joints, grip, tcp pose, contacts; why it ended)")
+    e.add_argument("--scene-cache", metavar="DIR", help="keep generated scenes here (default $VECTOR_ENV_SCENE_CACHE, "
+                   "else ~/.cache/vector-env/scenes)")
+    e.add_argument("--no-scene-cache", action="store_true", help="generate every scene afresh and keep none")
     v = sub.add_parser("verify", help="re-check a final round: regenerate its scenes from the published salt, "
                                       "check the results, optionally re-run an evaluated image")
     v.add_argument("--round", type=int, required=True)
@@ -233,6 +250,8 @@ def main(argv=None) -> int:
     v.add_argument("--docker", help="the docker binary")
     v.add_argument("--pull", action="store_true")
     v.add_argument("--salt-sha256", help="the salt commitment the board showed while the round was open")
+    v.add_argument("--allow-uncommitted", action="store_true",
+                   help="a round without a salt commitment time (salt_committed_at null) is a warning, not a problem")
     a = ap.parse_args(argv)
     return {"commit": cmd_commit, "status": cmd_status, "eval": cmd_eval, "verify": cmd_verify}[a.cmd](a)
 

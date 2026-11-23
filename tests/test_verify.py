@@ -144,7 +144,7 @@ def test_verify_regenerates_the_round_and_reruns_an_image(monkeypatch, capsys, e
                          "--command", "fake rate 0.8", "--scenes", "5")
     assert code == 0, err
     assert seen == ["/v1/skills/bin-picking/expert/rounds/4/verify", "/v1/skills/bin-picking/expert/rounds/4"]
-    assert out["ok"] and out["document"] == {"ok": True, "problems": []} and out["env"]["match"]
+    assert out["ok"] and out["document"] == {"ok": True, "problems": [], "warnings": []} and out["env"]["match"]
     assert out["salt"] == SALT and out["scenes"] == {"checked": 12, "matched": 12, "mismatched": [], "unverified": [],
                                                          "skipped_checked": 0}
     rr = out["rerun"]
@@ -461,6 +461,25 @@ def test_the_salt_commitment_is_checked(monkeypatch, capsys, env, tmp_path):
     serve(monkeypatch, doc, view={"round": {"n": 4, "salt_sha256": good}})
     code, out, _ = run(capsys, "--round", "4", "--api", "http://api", "--hash-scenes", "0")
     assert code == 0, out
+
+
+def test_a_round_without_a_salt_commitment_time(capsys, env, tmp_path):
+    doc = make_doc(fake_env(broken=env.scenes.broken))
+    for fn in (lambda d: d.__setitem__("salt_committed_at", None), lambda d: d.pop("salt_committed_at"),
+               lambda d: d.__setitem__("closed_at", None)):
+        p = write(tmp_path, _tampered(doc, fn))
+        code, out, err = run(capsys, "--round", "4", "--doc", p, "--hash-scenes", "0")
+        probs = out["document"]["problems"]
+        assert code == 1 and not out["document"]["ok"] and len(probs) == 1, out["document"]
+        assert "--allow-uncommitted" in probs[0] and ("salt_committed_at is null" in probs[0] or "closed_at" in probs[0])
+        code, out, err = run(capsys, "--round", "4", "--doc", p, "--hash-scenes", "0", "--allow-uncommitted")
+        assert code == 0 and out["document"]["ok"] and out["document"]["problems"] == [], out["document"]
+        assert len(out["document"]["warnings"]) == 1 and "warning: " in err
+    p = write(tmp_path, _tampered(doc, lambda d: d.__setitem__("salt_committed_at", None)))
+    code, out, _ = run(capsys, "--round", "4", "--doc", p, "--hash-scenes", "0", "--allow-uncommitted", "--salt-sha256", "1" * 64)
+    assert code == 1 and any("the commitment you gave" in x for x in out["document"]["problems"])
+    code, out, _ = run(capsys, "--round", "4", "--doc", write(tmp_path, doc), "--hash-scenes", "0")
+    assert code == 0 and out["document"]["warnings"] == []
 
 
 def test_the_decision_needs_its_king_image(capsys, env, tmp_path):
