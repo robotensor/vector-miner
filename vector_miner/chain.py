@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 
 import httpx
 
@@ -22,6 +23,9 @@ def _token(client: httpx.Client, challenge: str) -> str | None:
     return j.get("token") or j.get("access_token")
 
 
+ANON_REFUSED = "the registry refused an anonymous pull token (the image is private, or there is no such image)"
+
+
 def image_exists(ref: str, timeout: float = 20.0) -> tuple[bool, str]:
     img = parse_image(ref)
     url = f"https://{img['host']}/v2/{img['repo']}/manifests/{img['digest']}"
@@ -31,7 +35,7 @@ def image_exists(ref: str, timeout: float = 20.0) -> tuple[bool, str]:
             if r.status_code == 401:
                 tok = _token(c, r.headers.get("www-authenticate", ""))
                 if not tok:
-                    return False, "the registry refused an anonymous pull token (is the image public?)"
+                    return False, ANON_REFUSED
                 r = c.head(url, headers={"accept": ACCEPT, "authorization": f"Bearer {tok}"})
         except httpx.HTTPError as e:
             return False, f"registry unreachable: {e}"
@@ -43,6 +47,28 @@ def image_exists(ref: str, timeout: float = 20.0) -> tuple[bool, str]:
     if r.status_code == 404:
         return False, "no such image at that digest"
     return False, f"registry answered HTTP {r.status_code}"
+
+
+def own_pull(ref: str, docker: str = "docker", timeout: float = 60.0) -> bool:
+    """Whether this machine's docker login (DOCKER_CONFIG) can read the image's manifest."""
+    try:
+        p = subprocess.run([docker, "manifest", "inspect", ref], capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
+def image_access(ref: str, timeout: float = 20.0) -> tuple[str, str]:
+    """'public' (anyone can pull it), 'private' (anonymous pulls refused, your own docker login can pull it: the
+    subnet can pull it only once the package is shared with its team account) or 'missing' (with the reason)."""
+    ok, why = image_exists(ref, timeout)
+    if ok:
+        return "public", ""
+    if (why == ANON_REFUSED or why.startswith("no such image") or why in ("registry answered HTTP 401",
+                                                                          "registry answered HTTP 403")) \
+            and own_pull(parse_image(ref)["ref"]):
+        return "private", why
+    return "missing", why
 
 
 def commit_call(netuid: int, ref: str):

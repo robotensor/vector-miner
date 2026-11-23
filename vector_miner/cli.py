@@ -57,6 +57,29 @@ def check_no_submission(api: str, hotkey: str) -> None:
         raise SystemExit(board.refusal(hotkey, s))
 
 
+def pull_account(api: str | None) -> str | None:
+    """The subnet's team account that must be able to pull a private image (`pull_account` of the expert view)."""
+    if not api:
+        return None
+    import httpx
+
+    from .api import Api, ApiError
+    try:
+        got = Api(api, timeout=20.0).expert().get("pull_account")
+    except (ApiError, httpx.HTTPError, AttributeError):
+        return None
+    return got if isinstance(got, str) and got else None
+
+
+def private_warning(ref: str, api: str | None) -> str:
+    team = pull_account(api)
+    who = team or "the subnet's team account (`pull_account` in GET /v1/skills/bin-picking/expert)"
+    how = f"Package settings -> Manage access -> add {team or 'that account'}, role Read"
+    return (f"vector-miner: warning: {ref} is private (anonymous pulls are refused; your docker login can pull it). "
+            f"The subnet pulls it as {who}: share the package with it (Read) before you commit, or the commit is "
+            f"invalid. On ghcr.io: the package's {how}.")
+
+
 def cmd_commit(a) -> int:
     try:
         ref = parse_image(a.image)["ref"]
@@ -65,10 +88,12 @@ def cmd_commit(a) -> int:
     if not a.dev_api and a.netuid is None:
         raise SystemExit("--netuid is required")
     if not a.no_check:
-        from .chain import image_exists
-        ok, why = image_exists(ref)
-        if not ok:
+        from .chain import image_access
+        state, why = image_access(ref)
+        if state == "missing":
             raise SystemExit(f"the image is not pullable: {why} (--no-check to commit anyway)")
+        if state == "private":
+            print(private_warning(ref, getattr(a, "api", None) or getattr(a, "dev_api", None)), file=sys.stderr)
     kp = _keypair(a)
     if not a.no_api_check:
         check_no_submission(_api_or_exit(a, "commit first checks that this hotkey has no submission "

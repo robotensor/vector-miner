@@ -80,7 +80,7 @@ def test_private_image_is_refused(monkeypatch):
         return httpx.Response(401, headers={"www-authenticate": 'Bearer realm="https://ghcr.io/token",service="ghcr.io"'})
     _registry(monkeypatch, h)
     ok, msg = chain.image_exists(f"ghcr.io/alice/x@{D}")
-    assert not ok and "public" in msg
+    assert not ok and "private" in msg
 
 
 def _api(monkeypatch, handler):
@@ -507,3 +507,63 @@ def test_eval_enforces_the_phase1_deadlines_on_real_scenes(capsys, tmp_path):
     assert out["outcomes"] == {"step_timeout": 2} and out["deadlines"]["step_timeouts"] == 2, out
     assert "missed a phase-1 deadline" in cap.err and "--strict" in cap.err
     assert cli.main([*argv, "--command", f"{base} lag 5", "--step-deadline", "0.3", "--strict"]) == 1
+
+
+def _private_registry(req):
+    if req.url.path == "/token":
+        return httpx.Response(401)
+    return httpx.Response(401, headers={"www-authenticate": 'Bearer realm="https://ghcr.io/token",service="ghcr.io"'})
+
+
+def test_image_access_public_private_missing(monkeypatch):
+    pulls = []
+    monkeypatch.setattr(chain, "own_pull", lambda ref: pulls.append(ref) or ref.startswith("ghcr.io/alice/mine"))
+    mode = {"h": lambda req: httpx.Response(200, headers={"docker-content-digest": D})}
+    _registry(monkeypatch, lambda req: mode["h"](req))
+    assert chain.image_access(f"ghcr.io/alice/x@{D}") == ("public", "") and pulls == []
+    mode["h"] = _private_registry
+    assert chain.image_access(f"ghcr.io/alice/mine@{D}") == ("private", chain.ANON_REFUSED)
+    state, why = chain.image_access(f"ghcr.io/alice/other@{D}")
+    assert state == "missing" and "private, or there is no such image" in why
+    mode["h"] = lambda req: httpx.Response(500)
+    assert chain.image_access(f"ghcr.io/alice/mine@{D}")[0] == "missing"
+
+
+def test_own_pull_uses_docker_manifest_inspect(monkeypatch):
+    import subprocess
+    seen = []
+
+    class P:
+        returncode = 0
+    monkeypatch.setattr(chain.subprocess, "run", lambda argv, **k: seen.append(argv) or P())
+    assert chain.own_pull(f"ghcr.io/alice/x@{D}") and seen == [["docker", "manifest", "inspect", f"ghcr.io/alice/x@{D}"]]
+    P.returncode = 1
+    assert not chain.own_pull(f"ghcr.io/alice/x@{D}")
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired("docker", 1)
+    monkeypatch.setattr(chain.subprocess, "run", boom)
+    assert not chain.own_pull(f"ghcr.io/alice/x@{D}")
+
+
+def test_commit_warns_for_a_private_image_and_names_the_team_account(monkeypatch, capsys):
+    sent = []
+    monkeypatch.setattr(cli, "_keypair", lambda a: Keypair.create_from_uri("//Alice"))
+    monkeypatch.setattr(api_mod.Api, "dev_commit", lambda self, image: sent.append(image) or {"block": 1})
+    monkeypatch.setattr(chain, "image_access", lambda ref: ("private", chain.ANON_REFUSED))
+
+    def h(req):
+        if req.url.path == "/v1/skills/bin-picking/expert":
+            return httpx.Response(200, json={"pull_account": "teamacct", "registries": ["ghcr.io"]})
+        return _subs([])(req)
+    _api(monkeypatch, h)
+    assert cli.main(["commit", "--image", REF, "--dev-api", "http://api"]) == 0 and sent == [REF]
+    err = capsys.readouterr().err
+    assert "is private" in err and "share the package with it (Read)" in err and "add teamacct, role Read" in err
+    _api(monkeypatch, _subs([]))
+    assert cli.main(["commit", "--image", REF, "--dev-api", "http://api"]) == 0
+    assert "the subnet's team account (`pull_account`" in capsys.readouterr().err
+    monkeypatch.setattr(chain, "image_access", lambda ref: ("missing", "no such image at that digest"))
+    with pytest.raises(SystemExit, match="not pullable: no such image"):
+        cli.main(["commit", "--image", REF, "--dev-api", "http://api"])
+    assert len(sent) == 2

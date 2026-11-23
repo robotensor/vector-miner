@@ -8,7 +8,7 @@ commit one image, once per hotkey, and its evaluation starts as soon as your min
 flowchart LR
   A["write your expert (example/)"] --> B["vector-miner eval: local score"]
   B --> DT["vector-miner eval --determinism N"]
-  DT --> C["docker build, push to ghcr.io (public)"]
+  DT --> C["docker build, push to ghcr.io (public, or private and shared with the team account)"]
   C --> E["image@sha256 digest"]
   R["btcli subnet register: hotkey gets a uid"] --> F
   E --> F["vector-miner commit (once per hotkey, ever)"]
@@ -17,7 +17,7 @@ flowchart LR
   SC -->|"not above the king's best + margin"| BK["below_king (final)"]
   SC -->|"above"| Q["phase-2 queue, highest score first"]
   Q --> CP["the subnet copies your image into its registry"]
-  CP -->|"the image is gone (deleted, private)"| DQ["disqualified"]
+  CP -->|"the image is gone (deleted, or private and not shared)"| DQ["disqualified"]
   CP --> P2["phase 2: the copy runs in docker on 100 of the scenes"]
   P2 -->|"an action hash differs, or a scene is over the wall"| DQ
   P2 -->|"all equal"| KR["king run: the king's image on all 1,000 of your scenes"]
@@ -35,8 +35,8 @@ On commit the subnet makes a secret salt for your submission and publishes its `
 are drawn from that salt. Phase 1 is played on your machine: `vector-miner serve` dials out to the subnet, our
 simulator plays every scene against your image step by step, and each scene's rows are hashed (the action hash).
 When your submission reaches the head of the phase-2 queue, the subnet first copies your committed image into its
-own registry (keep the image public until then: an image that is gone is `disqualified`, "image no longer
-available"); everything after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of
+own registry (until then keep the image public, or private and shared with the subnet's team account with Read
+access: an image the subnet cannot pull then is `disqualified`, "image no longer available"); everything after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of
 those scenes: every action hash must equal phase 1's, or the submission is disqualified. Then the king's image plays
 all 1,000 of your scenes. When you beat the king by more than the margin (0.02) on those same scenes (an exact
 comparison of success counts), the decisive re-check runs your copy again on every scene you won and the king lost
@@ -94,7 +94,8 @@ cd example && docker build -t ghcr.io/<you>/bin-expert:dev . && cd ..
 echo <github-token> | docker login ghcr.io -u <github-user> --password-stdin
 docker push ghcr.io/<you>/bin-expert:dev
 
-# 4. on GitHub: the package's settings -> change visibility -> public
+# 4. on GitHub: the package's settings -> change visibility -> public, or keep it private and
+#    Manage access -> add the team account (`pull_account` in GET <api>/v1/skills/bin-picking/expert), role Read
 
 # 5. the digest
 docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/<you>/bin-expert:dev    # ghcr.io/<you>/bin-expert@sha256:<digest>
@@ -324,8 +325,12 @@ vector-miner verify --submission ID (--api URL | --doc FILE) [--save FILE] [--ha
   `--scene-cache DIR` (or `VECTOR_ENV_SCENE_CACHE`) moves the cache, `--no-scene-cache` turns it off.
 - `commit` applies the subnet's checks before it sends anything: the reference is
   `<registry>/<repo>@sha256:<64 hex>` (lower case, no tag), at most 128 characters, and the registry is `ghcr.io`.
-  It then asks the registry anonymously for that digest, as the subnet does: a private image, an unknown digest or
-  a registry that answers another digest is refused (`--no-check` skips this). The reference is committed without
+  It then asks the registry anonymously for that digest: an unknown digest or a registry that answers another digest
+  is refused (`--no-check` skips this). A private image (anonymous pulls refused) that your own docker login can
+  read (`docker manifest inspect`) is committed with a warning: the subnet pulls images as its team account
+  (`pull_account` of `GET /v1/skills/bin-picking/expert`, named in the warning), so share the package with that
+  account (ghcr.io: Package settings -> Manage access -> add it, role Read) before you commit, or the commit is
+  `invalid`. The reference is committed without
   surrounding spaces.
 - One submission per hotkey, ever. `commit` asks the public API
   (`GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`) first and refuses when the hotkey's submission is
