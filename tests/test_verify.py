@@ -197,9 +197,10 @@ def test_not_final_unknown_image_and_bad_arguments(monkeypatch, capsys, env, tmp
     broken.write_text("{")
     code, out, err = run(capsys, "--round", "4", "--doc", str(broken))
     assert code == 2 and out is None and "cannot read" in err
-    with pytest.raises(SystemExit) as e:
-        cli.main(["verify"])
-    assert e.value.code == 2
+    code, out, err = run(capsys)
+    assert code == 2 and out is None and "--submission ID" in err
+    code, out, err = run(capsys, "--round", "4", "--submission", "x", "--doc", str(broken))
+    assert code == 2 and out is None and "--submission ID" in err
 
 
 def _tampered(doc, fn):

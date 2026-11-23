@@ -364,8 +364,8 @@ def _generator_works(e: SimpleNamespace, rows: dict, failed: set, draw) -> tuple
 
 
 def regenerate(doc: dict, e: SimpleNamespace, indexes: list[int], log=_log, local: dict | None = None,
-               skipped: list[int] = ()) -> dict:
-    n, salt, draw = doc["round"], doc["salt"], doc.get("draw")
+               skipped: list[int] = (), n: int | None = None) -> dict:
+    n, salt, draw = doc["round"] if n is None else n, doc["salt"], doc.get("draw")
     tries = doc.get("seed_tries") or 6
     rows = {x["index"]: x for x in doc["scenes"]}
     top = doc.get("env") or {}
