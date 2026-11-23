@@ -16,10 +16,14 @@ flowchart LR
   SV --> SC["phase-1 score"]
   SC -->|"not above the king's best + margin"| BK["below_king (final)"]
   SC -->|"above"| Q["phase-2 queue, highest score first"]
-  Q --> P2["phase 2: the subnet runs your image in docker on 100 of the scenes"]
-  P2 -->|"an action hash differs, or a scene is over the wall"| DQ["disqualified"]
+  Q --> CP["the subnet copies your image into its registry"]
+  CP -->|"the image is gone (deleted, private)"| DQ["disqualified"]
+  CP --> P2["phase 2: the copy runs in docker on 100 of the scenes"]
+  P2 -->|"an action hash differs, or a scene is over the wall"| DQ
   P2 -->|"all equal"| KR["king run: the king's image on all 1,000 of your scenes"]
-  KR -->|"you > king + 0.02"| CR["crowned"]
+  KR -->|"you > king + 0.02"| DC["decisive re-check: the copy in docker on every scene you won and the king lost"]
+  DC -->|"all equal, within the wall"| CR["crowned"]
+  DC -->|"an action hash differs, or a scene is over the wall"| DQ
   KR -->|"else"| NC["not_crowned"]
   CR --> V["vector-miner verify --submission ID"]
   NC --> V
@@ -30,9 +34,14 @@ flowchart LR
 On commit the subnet makes a secret salt for your submission and publishes its `salt_sha256`; the 1,000 scenes
 are drawn from that salt. Phase 1 is played on your machine: `vector-miner serve` dials out to the subnet, our
 simulator plays every scene against your image step by step, and each scene's rows are hashed (the action hash).
-Phase 2 re-runs your committed image on our side (docker, `--network none`) on 100 of those scenes: every action
-hash must equal phase 1's, or the submission is disqualified. Then the king's image plays all 1,000 of your scenes,
-and the crown moves automatically when you beat the king by more than the margin (0.02) on those same scenes.
+When your submission reaches the head of the phase-2 queue, the subnet first copies your committed image into its
+own registry (keep the image public until then: an image that is gone is `disqualified`, "image no longer
+available"); everything after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of
+those scenes: every action hash must equal phase 1's, or the submission is disqualified. Then the king's image plays
+all 1,000 of your scenes. When you beat the king by more than the margin (0.02) on those same scenes (an exact
+comparison of success counts), the decisive re-check runs your copy again on every scene you won and the king lost
+that phase 2 did not already run: every action hash must equal phase 1's and every scene must fit the wall, or the
+submission is disqualified. Only then does the crown move, automatically.
 
 ## Setup
 
@@ -220,8 +229,13 @@ flowchart TD
   A late act ends the scene as `step_timeout`, a scene over its wall time as `wall_timeout`; both, and a dropped
   connection, are your failures, and phase 2 leaves those scenes out of its sample. `vector-miner eval` holds your
   expert to the same deadlines. Containers are started ahead (`--warm N`, default `--concurrency`) so a scene does
-  not wait for `docker run`; `--concurrency N` (default 8, what the subnet sends at once) bounds the scenes running.
-  Keep it at 8: a scene that waits for a free slot spends its first-act time.
+  not wait for `docker run`; `--concurrency N` (default 8, what the subnet sends at once) is the most scenes `serve`
+  runs at once: a `start` past it is answered with an error (that scene is your `expert_error`) and the welcome's
+  `concurrency` above yours is logged as a warning, so keep it at 8. A `start` for a restart of a scene
+  (`<index>.<n>`) replaces the older one. Messages from the subnet are at most 4 MiB.
+- The subnet checks every act: a message is at most 64 KiB (300 rows of 7 numbers fit), at most 200 messages a second
+  are read per socket (faster ones wait), and a row must be 7 finite numbers within ±100. `NaN`, `Infinity`, a string,
+  `true` or a larger value ends that scene as `expert_error`, your failure.
 - When the connection drops, the running scenes' containers are killed and `serve` reconnects with backoff
   (1 s doubling to 60 s, times 0.5 to 1); the subnet restarts the unfinished scenes from tick 0, at most twice per
   scene. Keep `serve` running until it prints `done`.
@@ -255,17 +269,17 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 
 | status | meaning |
 |---|---|
-| `waiting_connection` | committed; run `serve` (abandoned after 48 h without a connection) |
-| `phase1` | `serve` is playing your scenes: `phase1.done` of `phase1.total` |
+| `waiting_connection` | committed; run `serve` (abandoned after 48 h without any connection attempt; a refusal because every slot is busy counts as an attempt) |
+| `phase1` | `serve` is playing your scenes: `phase1.done` of `phase1.total`. After the first hour on the socket it must keep up 200 scenes an hour on average (8 at once do ≥ 640), or the rest count as failures and the slot goes to the next miner |
 | `scored` | phase 1 is done and above the king's best + margin: in the phase-2 queue (`queue_position`) |
 | `below_king` | phase 1 is not above the king's best + margin; final. A queued submission is re-checked after every crowning |
-| `phase2` | we run your image in docker on 100 of your scenes and compare action hashes |
-| `king_run` | phase 2 passed; the king's image plays all your scenes |
+| `phase2` | `stage` `copy`: we copy your image into our registry; then we run the copy in docker on 100 of your scenes and compare action hashes |
+| `king_run` | phase 2 passed; the king's image plays all your scenes; `stage` `decisive`: the decisive re-check (`decisive {done, total}`) |
 | `crowned` / `not_crowned` | your phase-1 score against the king's on the same scenes, with the margin; final |
-| `disqualified` | phase 2 found another action hash or a scene over the wall (`reason`); final |
+| `disqualified` | phase 2 or the decisive re-check found another action hash or a scene over the wall, the image was gone when we copied it, or a stage failed on our side again after 2 reviews (`reason`); final |
 | `duplicate_hotkey` | a second commit from a hotkey that already had one; never evaluated |
 | `invalid` / `copy` | a bad commit, the digest of an earlier submission; neither uses the hotkey's submission, so it may commit again |
-| `abandoned` | no connection within 48 h; final, and it used the hotkey's submission |
+| `abandoned` | no connection attempt within 48 h; final, and it does not use the hotkey's submission: the hotkey may commit again |
 | `review` | more than 2 % of a stage's scenes failed on the subnet's side; that stage runs again at `retry_at` (6 h later). Not your expert's fault; in phase 1 keep `serve` running |
 
 ## Commands
@@ -315,9 +329,11 @@ vector-miner verify --submission ID (--api URL | --doc FILE) [--save FILE] [--ha
   surrounding spaces.
 - One submission per hotkey, ever. `commit` asks the public API
   (`GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`) first and refuses when the hotkey's submission is
-  used: any earlier commit except an `invalid`, `copy` or `duplicate_hotkey` one, which the subnet does not count.
+  used: any earlier commit except an `invalid`, `copy`, `duplicate_hotkey` or `abandoned` one, which the subnet does
+  not count.
   The subnet would record a second commit as `duplicate_hotkey` and never evaluate it. To submit another image, register another hotkey. When the API cannot be reached `commit` stops;
-  `--no-api-check` skips the check (the testnet trial). The same digest as an earlier submission is a `copy`.
+  `--no-api-check` skips the check (the testnet trial). The same digest, or the same image layers under another
+  digest, as an earlier submission of another hotkey is a `copy`.
 - After a commit, `commit` prints the `serve` command to start; phase 1 waits for it at most 48 h.
 
 ### Inspect a failure
@@ -341,7 +357,8 @@ Once a submission is final (`below_king`, `crowned`, `not_crowned` or `disqualif
 needed to check it at `GET /v1/skills/bin-picking/expert/submissions/<id>/verify` (404 until then): the salt and
 its commitment, the vector-env version and asset sha256 the scenes were made with, every scene's seed and state
 hash, phase 1 (score and per-scene success, time, outcome, action hash), phase 2 (the scenes, their action hashes
-and wall times), the king's run on the same scenes and the decision.
+and wall times), the king's run on the same scenes, the decisive re-check (its scenes, action hashes and wall times)
+and the decision; `submission.mirror_url` is the subnet's copy of the image.
 
 ```mermaid
 flowchart LR
@@ -350,7 +367,7 @@ flowchart LR
   S --> SD["seed i = sha256(salt:0:i)[:6] + k"]
   SD --> G["vector-env: generate the scene"]
   G --> H{"seed and state hash = published?"}
-  D["published phase 1, phase 2, king run"] --> C{"scores, phase-2 hashes, gate, crown add up?"}
+  D["published phase 1, phase 2, king run, decisive"] --> C{"scores, phase-2 and decisive hashes, gate, crown add up?"}
   G --> R["--image: run an image on K sampled scenes"]
   R --> A{"action hash = published?"}
 ```
@@ -389,9 +406,14 @@ flowchart LR
   infrastructure failures and `not_run` left out). Each phase-2 scene has an outcome, an action hash and a wall
   time; phase-2 infrastructure failures are left out of the
   comparison, and it passes when at least one scene is compared, every hash equals phase 1's and no scene is a
-  `wall_timeout` or over `wall_s`; `disqualified` needs a phase 2 that did not pass and a reason; `crowned` and
-  `not_crowned` need phase 2 passed and a king run, whose score and `decision.score` are successes on the scenes
-  where both runs gave a verdict, and `crowned` exactly when the submission's is above the king's + `margin` there.
+  `wall_timeout` or over `wall_s`; `disqualified` needs a phase 2 that did not pass and a reason, or a failed
+  decisive re-check after a passed phase 2 and a king run it beat, or a reason that starts with `image no longer
+  available` / `repeated failures on our side` (then nothing after phase 1 is needed); `crowned` and `not_crowned`
+  need phase 2 passed and a king run, whose score and `decision.score` are successes on the scenes where both runs
+  gave a verdict, and `crowned` exactly when (successes − king successes) / compared is above `margin` (exact
+  fractions; the gate is compared the same way). The decisive scenes are recomputed: both runs gave a verdict, the
+  submission succeeded and the king did not, not in `phase2.scenes`; `crowned` needs a `decisive` section on exactly
+  those scenes with phase 1's action hashes, none over `wall_s`; `not_crowned` has none.
   Images must be `ghcr.io/<repo>@sha256:<digest>` with their own `digest`; the genesis king (no `id`) runs as a
   command and has no image: a warning `king: no image published`, and `--image king` skips the re-run.
 - `--image` takes `submission`, `king`, or that image's reference, digest or hotkey; it runs the image (or
@@ -399,7 +421,8 @@ flowchart LR
   `hash_equal`, `hash_agreement`, `outcome_agreement` and every scene whose action hash differs. A deterministic
   image gives the published hashes on any machine. Re-run differences do not change the exit code.
 - `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched`, `over_wall`, `infra`,
-  `passed`; `same_scenes` repeats the decision: `compared`, `score`, `king_score`.
+  `passed`; `decisive` the decisive re-check: `scenes`, `equal`, `mismatched`, `over_wall`, `infra`, `expected` (the
+  recomputed decisive scenes), `passed`; `same_scenes` repeats the decision: `compared`, `score`, `king_score`.
 - The document is read as strict JSON (no NaN), at most 64 MB, and every field is type-checked first.
 - Regeneration needs the same vector-env version and asset bundle as the submission (`env` in the document, or a
   scene's own `env` when it was made with another one); with another one, the output warns, and a scene whose
