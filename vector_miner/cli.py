@@ -172,11 +172,12 @@ def cmd_serve(a) -> int:
 def cmd_eval(a) -> int:
     try:
         from vector_env import harness
-        from vector_env.cli import EvalError, evaluate, report
+        from vector_env.cli import EvalError, report
         from vector_env.compose import SceneError
         from vector_env.node import SimError
     except ImportError:
         raise SystemExit("vector-miner eval needs vector-env (scripts/setup.sh installs it)") from None
+    from . import local
     if a.command:
         import shlex
         expert = {"command": shlex.split(a.command)}
@@ -184,6 +185,10 @@ def cmd_eval(a) -> int:
         expert = {"image": a.image}
     else:
         raise SystemExit("give --image REF or --command \"...\"")
+    for k in ("step_deadline", "first_step_deadline"):
+        v = getattr(a, k)
+        if v is not None and not (math.isfinite(v) and v > 0):
+            raise SystemExit(f"--{k.replace('_', '-')} must be a positive number of seconds")
     docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
     if a.image and a.pull:
         try:
@@ -197,38 +202,49 @@ def cmd_eval(a) -> int:
     n = a.determinism if a.determinism is not None else a.scenes
     if n < 1:
         raise SystemExit("--scenes and --determinism must be at least 1")
+    limits = local.deadlines(a.first_step_deadline, a.step_deadline)
     try:
-        r = evaluate(expert, n, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall, docker=docker,
-                     stderr_dir=a.stderr, trace_dir=a.trace,
-                     scene_cache_dir=False if a.no_scene_cache else a.scene_cache)
+        r = local.evaluate(expert, n, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall,
+                           docker=docker, stderr_dir=a.stderr, trace_dir=a.trace,
+                           scene_cache_dir=False if a.no_scene_cache else a.scene_cache, limits=limits,
+                           again=1 if a.determinism is not None else 0)
     except (AssetsError, EvalError, SceneError, SimError, harness.HarnessError, ValueError) as e:
         print(f"vector-miner: {e}", file=sys.stderr)
         return 2
     if a.determinism is None:
-        return report(r, a.results, "vector-miner")
-    return _determinism(a, expert, docker, r, harness)
+        code = report(r, a.results, "vector-miner")
+        return _deadline_verdict(a, r, code)
+    return _deadline_verdict(a, r, _determinism(a, r, harness))
 
 
-def _determinism(a, expert: dict, docker: dict, r: dict, harness) -> int:
+def _deadline_verdict(a, r: dict, code: int) -> int:
+    from . import local
+    if code == 2:
+        return code
+    lat = r["latency"]
+    for line in local.report_lines(lat):
+        print(f"vector-miner: {line}", file=sys.stderr)
+    if a.strict and lat["late_scenes"] and code == 0:
+        return 1
+    return code
+
+
+def _determinism(a, r: dict, harness) -> int:
     from vector_env.cli import infra_problem
     why = infra_problem(r["summary"], r["results"])
     if why:
         print(f"vector-miner: {why}", file=sys.stderr)
         return 2
     s = r["summary"]
-    print(f"vector-miner: run 2 of 2: the same {len(r['scenes'])} scenes again, in reverse order", file=sys.stderr)
-    scs = list(reversed(r["scenes"]))
-    again = harness.run(expert, scs, time_limit_s=s["time_limit_s"], wall_s=s["wall_s"], workers=a.workers,
-                        docker=docker,
-                        on_result=lambda i, x: print(f"{x['scene_id']}: {x['outcome']} hash={x.get('action_hash')}",
-                                                     file=sys.stderr))
+    again = r["runs"][1]
     c = harness.compare(r["results"], again)
     if a.results:
         with open(a.results, "w") as f:
             for x in r["results"] + again:
                 f.write(json.dumps(x, separators=(",", ":")) + "\n")
     out = {"scenes": s["scenes"], "seed": s["seed"], "score": s["score"], "score_again": harness.summary(again)["score"],
-           "determinism": {k: c[k] for k in ("compared", "equal", "all_equal", "mismatched", "infra")}}
+           "determinism": {k: c[k] for k in ("compared", "equal", "all_equal", "mismatched", "infra")},
+           "deadlines": s.get("deadlines")}
     print(json.dumps(out))
     if c["all_equal"]:
         print(f"vector-miner: deterministic on {c['compared']} scenes: every action hash matched", file=sys.stderr)
@@ -264,8 +280,6 @@ def _verify_args(a) -> str | None:
 
 
 def _verify(a) -> int:
-    from . import verify as vf
-
     def bad(msg: str) -> int:
         print(f"vector-miner: {msg}", file=sys.stderr)
         return 2
@@ -273,61 +287,9 @@ def _verify(a) -> int:
     why = _verify_args(a)
     if why:
         return bad(why)
-    if (a.round is None) == (a.submission is None):
-        return bad("give --submission ID (or --round N for a weekly round before v8)")
-    if a.submission is not None:
-        return _verify_submission(a, bad)
-    salt_expect, salt_source = a.salt_sha256, "you gave"
-    try:
-        if a.doc:
-            doc = vf.read_file(a.doc)
-            r = doc.get("round")
-            if isinstance(r, int) and not isinstance(r, bool) and r != a.round:
-                return bad(f"{a.doc} is round {r}, not {a.round}")
-        else:
-            if not a.api:
-                return bad("--api (or VECTOR_MINER_API) is required without --doc")
-            import httpx
-
-            from .api import Api, ApiError
-            try:
-                raw = Api(a.api).round_verify(a.round, vf.MAX_DOC_BYTES)
-            except ApiError as e:
-                return bad(f"round {a.round}: {e.detail}" if e.status == 404 else str(e))
-            except httpx.HTTPError as e:
-                return bad(f"cannot reach {a.api}: {e}")
-            doc = vf.loads(raw)
-            if not a.salt_sha256:
-                try:
-                    seen = (Api(a.api).round(a.round).get("round") or {}).get("salt_sha256")
-                except (ApiError, httpx.HTTPError, ValueError, AttributeError) as e:
-                    print(f"vector-miner: warning: the round view did not load ({e}); checking salt_sha256 "
-                          "against the document only", file=sys.stderr)
-                    seen = None
-                if isinstance(seen, str) and seen:
-                    salt_expect, salt_source = seen.strip().lower()[:64], "of the round view"
-        if a.save:
-            try:
-                with open(a.save, "w") as f:
-                    json.dump(doc, f, separators=(",", ":"))
-            except OSError as e:
-                return bad(f"cannot write {a.save}: {e}")
-        expert = None
-        if a.command:
-            import shlex
-            try:
-                expert = {"command": shlex.split(a.command)}
-            except ValueError as e:
-                return bad(f"--command: {e}")
-        docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
-        out = vf.verify(doc, hash_scenes=a.hash_scenes, image=a.image, expert=expert, rerun_scenes=a.scenes,
-                        sample_seed=a.sample_seed, wall_s=a.wall, workers=a.workers, docker=docker,
-                        salt_sha256=salt_expect, salt_source=salt_source, pull=a.pull,
-                        allow_uncommitted=a.allow_uncommitted)
-    except vf.VerifyError as e:
-        return bad(str(e))
-    print(json.dumps(out, indent=1))
-    return vf.exit_code(out)
+    if a.submission is None:
+        return bad("give --submission ID")
+    return _verify_submission(a, bad)
 
 
 def _verify_submission(a, bad) -> int:
@@ -428,7 +390,8 @@ def main(argv=None) -> int:
     sv.add_argument("--docker", help="the docker binary")
     sv.add_argument("--pull", action="store_true", help="pull the image first when it is not local")
     sv.add_argument("--stderr", metavar="DIR", help="write each container's stderr to DIR/<container name>.log")
-    e = sub.add_parser("eval", help="local evaluation: random scenes through the same step harness the subnet uses")
+    e = sub.add_parser("eval", help="local evaluation: random scenes played the way phase 1 plays them, with its "
+                                    "step deadlines")
     e.add_argument("--image", help="your image (any local tag or ghcr.io/<you>/<repo>@sha256:<digest>)")
     e.add_argument("--command", help="run a local program instead of the image (while developing)")
     e.add_argument("--scenes", type=int, default=20)
@@ -449,15 +412,19 @@ def main(argv=None) -> int:
     e.add_argument("--no-scene-cache", action="store_true", help="generate every scene afresh and keep none")
     e.add_argument("--determinism", type=int, metavar="N", help="run N scenes twice and compare every action hash "
                    "(phase 2 needs them equal)")
+    e.add_argument("--first-step-deadline", type=float, metavar="S", help="seconds the expert has to answer start "
+                   "(phase 1: 10)")
+    e.add_argument("--step-deadline", type=float, metavar="S", help="seconds the expert has to answer each later state "
+                   "(phase 1: 2)")
+    e.add_argument("--strict", action="store_true", help="exit 1 when a scene missed a phase-1 deadline")
     v = sub.add_parser("verify", help="re-check a final submission: regenerate its scenes from the published salt, "
                                       "check phase 1, phase 2 and the king run, optionally re-run an image")
     v.add_argument("--submission", help="the submission id")
-    v.add_argument("--round", type=int, help="a weekly round from before v8 instead")
     v.add_argument("--api", default=os.environ.get("VECTOR_MINER_API"))
     v.add_argument("--doc", help="read a saved verify document instead of fetching it")
     v.add_argument("--save", help="write the fetched document here")
-    v.add_argument("--image", help="re-run this image (its reference, digest or hotkey; with --submission also "
-                                   "'submission' or 'king') on --scenes scenes")
+    v.add_argument("--image", help="re-run this image ('submission', 'king', or its reference, digest or hotkey) "
+                                   "on --scenes scenes")
     v.add_argument("--command", help="with --image: run a local program in its place (no docker)")
     v.add_argument("--scenes", type=int, default=20, help="scenes to re-run the image on (sampled)")
     v.add_argument("--hash-scenes", type=int, help="regenerate only this many sampled scenes (default: all)")
@@ -468,7 +435,7 @@ def main(argv=None) -> int:
     v.add_argument("--memory")
     v.add_argument("--docker", help="the docker binary")
     v.add_argument("--pull", action="store_true")
-    v.add_argument("--salt-sha256", help="the salt commitment shown at commit (or while the round was open)")
+    v.add_argument("--salt-sha256", help="the salt commitment shown at commit")
     v.add_argument("--allow-uncommitted", action="store_true",
                    help="no salt commitment time (salt_committed_at null) is a warning, not a problem")
     a = ap.parse_args(argv)

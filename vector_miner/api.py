@@ -50,9 +50,6 @@ class Api:
     def expert(self) -> dict:
         return self.get(f"/v1/skills/{SKILL}/expert")
 
-    def round(self, n: int) -> dict:
-        return self.get(f"/v1/skills/{SKILL}/expert/rounds/{int(n)}")
-
     def get_bytes(self, path: str, max_bytes: int) -> bytes:
         body = bytearray()
         with self.http.stream("GET", self.base + path) as r:
@@ -73,9 +70,6 @@ class Api:
                 detail = body.decode(errors="replace")
             raise ApiError(r.status_code, str(detail)[:2000])
         return bytes(body)
-
-    def round_verify(self, n: int, max_bytes: int) -> bytes:
-        return self.get_bytes(f"/v1/skills/{SKILL}/expert/rounds/{int(n)}/verify", max_bytes)
 
     def nonce(self) -> str:
         j = self.get("/v1/expert/nonce")
