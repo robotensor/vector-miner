@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
 
 from .protocol import BadImage, parse_image
@@ -74,55 +76,92 @@ def cmd_eval(a) -> int:
     return 0
 
 
-def cmd_verify(a) -> int:
-    from .verify import VerifyError, verify
+def _verify_args(a) -> str | None:
+    if a.command and not a.image:
+        return "--command replaces an evaluated image: give --image REF too"
+    if a.workers < 1:
+        return "--workers must be at least 1"
+    if a.scenes < 0 or (a.hash_scenes is not None and a.hash_scenes < 0):
+        return "--scenes and --hash-scenes cannot be negative"
+    for k in ("wall", "cpus"):
+        v = getattr(a, k)
+        if v is not None and not (math.isfinite(v) and v > 0):
+            return f"--{k} must be a positive number"
+    if a.salt_sha256 is not None:
+        a.salt_sha256 = a.salt_sha256.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", a.salt_sha256):
+            return "--salt-sha256 takes the 64 hex characters shown while the round was open"
+    return None
+
+
+def _verify(a) -> int:
+    from . import verify as vf
 
     def bad(msg: str) -> int:
         print(f"vector-miner: {msg}", file=sys.stderr)
         return 2
 
-    if a.command and not a.image:
-        return bad("--command replaces an evaluated image: give --image REF too")
-    if a.doc:
-        try:
-            with open(a.doc) as f:
-                doc = json.load(f)
-        except (OSError, ValueError) as e:
-            return bad(f"cannot read {a.doc}: {e}")
-        if not isinstance(doc, dict):
-            return bad(f"{a.doc} is not a verify document")
-        if str(doc.get("round")) != str(a.round):
-            return bad(f"{a.doc} is round {doc.get('round')}, not {a.round}")
-    else:
-        if not a.api:
-            return bad("--api (or VECTOR_MINER_API) is required without --doc")
-        from .api import Api, ApiError
-        try:
-            doc = Api(a.api).round_verify(a.round)
-        except ApiError as e:
-            print(f"vector-miner: round {a.round}: {e.detail}" if e.status == 404 else f"vector-miner: {e}", file=sys.stderr)
-            return 2
-    if a.save:
-        with open(a.save, "w") as f:
-            json.dump(doc, f, separators=(",", ":"))
-    expert = None
-    if a.command:
-        import shlex
-        expert = {"command": shlex.split(a.command)}
-    docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
+    why = _verify_args(a)
+    if why:
+        return bad(why)
+    salt_expect, salt_source = a.salt_sha256, "you gave"
     try:
-        if a.pull and a.image and not a.command:
-            from .verify import find_image, load_env
-            ref = find_image(doc, a.image).get("run_image")
-            if ref:
-                load_env().harness.pull(ref, docker)
-        out = verify(doc, hash_scenes=a.hash_scenes, image=a.image, expert=expert, rerun_scenes=a.scenes,
-                     sample_seed=a.sample_seed, wall_s=a.wall, workers=a.workers, docker=docker)
-    except VerifyError as e:
-        print(f"vector-miner: {e}", file=sys.stderr)
-        return 2
+        if a.doc:
+            doc = vf.read_file(a.doc)
+            r = doc.get("round")
+            if isinstance(r, int) and not isinstance(r, bool) and r != a.round:
+                return bad(f"{a.doc} is round {r}, not {a.round}")
+        else:
+            if not a.api:
+                return bad("--api (or VECTOR_MINER_API) is required without --doc")
+            import httpx
+
+            from .api import Api, ApiError
+            try:
+                raw = Api(a.api).round_verify(a.round, vf.MAX_DOC_BYTES)
+            except ApiError as e:
+                return bad(f"round {a.round}: {e.detail}" if e.status == 404 else str(e))
+            except httpx.HTTPError as e:
+                return bad(f"cannot reach {a.api}: {e}")
+            doc = vf.loads(raw)
+            if not a.salt_sha256:
+                try:
+                    seen = (Api(a.api).round(a.round).get("round") or {}).get("salt_sha256")
+                except (ApiError, httpx.HTTPError, ValueError, AttributeError) as e:
+                    print(f"vector-miner: warning: the round view did not load ({e}); checking salt_sha256 "
+                          "against the document only", file=sys.stderr)
+                    seen = None
+                if isinstance(seen, str) and seen:
+                    salt_expect, salt_source = seen.strip().lower()[:64], "of the round view"
+        if a.save:
+            try:
+                with open(a.save, "w") as f:
+                    json.dump(doc, f, separators=(",", ":"))
+            except OSError as e:
+                return bad(f"cannot write {a.save}: {e}")
+        expert = None
+        if a.command:
+            import shlex
+            try:
+                expert = {"command": shlex.split(a.command)}
+            except ValueError as e:
+                return bad(f"--command: {e}")
+        docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
+        out = vf.verify(doc, hash_scenes=a.hash_scenes, image=a.image, expert=expert, rerun_scenes=a.scenes,
+                        sample_seed=a.sample_seed, wall_s=a.wall, workers=a.workers, docker=docker,
+                        salt_sha256=salt_expect, salt_source=salt_source, pull=a.pull)
+    except vf.VerifyError as e:
+        return bad(str(e))
     print(json.dumps(out, indent=1))
-    return 0 if out["ok"] else 1
+    return vf.exit_code(out)
+
+
+def cmd_verify(a) -> int:
+    try:
+        return _verify(a)
+    except Exception as e:
+        print(f"vector-miner: cannot check: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
 
 
 def main(argv=None) -> int:
@@ -172,6 +211,7 @@ def main(argv=None) -> int:
     v.add_argument("--memory")
     v.add_argument("--docker", help="the docker binary")
     v.add_argument("--pull", action="store_true")
+    v.add_argument("--salt-sha256", help="the salt commitment the board showed while the round was open")
     a = ap.parse_args(argv)
     return {"commit": cmd_commit, "status": cmd_status, "eval": cmd_eval, "verify": cmd_verify}[a.cmd](a)
 

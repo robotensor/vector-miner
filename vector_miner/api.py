@@ -7,6 +7,7 @@ import httpx
 from .protocol import sign_headers
 
 SKILL = "bin-picking"
+MAX_BYTES = 64 << 20
 
 
 class ApiError(Exception):
@@ -34,8 +35,12 @@ class Api:
             raise ApiError(r.status_code, str(detail))
         return r.json()
 
-    def get(self, path: str) -> dict:
-        return self._check(self.http.get(self.base + path))
+    def get(self, path: str, max_bytes: int = MAX_BYTES) -> dict:
+        raw = self.get_bytes(path, max_bytes)
+        try:
+            return json.loads(raw)
+        except (ValueError, RecursionError):
+            raise ApiError(200, "the response is not JSON") from None
 
     def post_signed(self, path: str, obj: dict | None = None) -> dict:
         body = json.dumps(obj or {}, separators=(",", ":")).encode()
@@ -47,8 +52,29 @@ class Api:
     def round(self, n: int) -> dict:
         return self.get(f"/v1/skills/{SKILL}/expert/rounds/{int(n)}")
 
-    def round_verify(self, n: int) -> dict:
-        return self.get(f"/v1/skills/{SKILL}/expert/rounds/{int(n)}/verify")
+    def get_bytes(self, path: str, max_bytes: int) -> bytes:
+        body = bytearray()
+        with self.http.stream("GET", self.base + path) as r:
+            try:
+                size = int(r.headers.get("content-length") or 0)
+            except ValueError:
+                size = 0
+            if size > max_bytes:
+                raise ApiError(r.status_code, f"the response is larger than {max_bytes} bytes")
+            for chunk in r.iter_bytes():
+                body += chunk
+                if len(body) > max_bytes:
+                    raise ApiError(r.status_code, f"the response is larger than {max_bytes} bytes")
+        if r.status_code >= 400:
+            try:
+                detail = json.loads(bytes(body)).get("detail", body.decode(errors="replace"))
+            except (ValueError, AttributeError):
+                detail = body.decode(errors="replace")
+            raise ApiError(r.status_code, str(detail)[:2000])
+        return bytes(body)
+
+    def round_verify(self, n: int, max_bytes: int) -> bytes:
+        return self.get_bytes(f"/v1/skills/{SKILL}/expert/rounds/{int(n)}/verify", max_bytes)
 
     def status(self, hotkey: str, rounds: int = 3) -> dict:
         ex = self.expert()

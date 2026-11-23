@@ -110,15 +110,18 @@ vector-miner verify --round N (--api https://vector.robotensor.ai | --doc FILE) 
 
 ## Verify a round
 
-Nobody sees a round's scenes before the evaluation: they come from a salt made when the round closes. Once the
-round is final (evaluated, and the crown kept or moved), the API publishes everything needed to check it at
-`GET /v1/skills/bin-picking/expert/rounds/<n>/verify` (404 until then): the salt, the vector-env version and asset
+Nobody sees a round's scenes before the evaluation: they come from a salt drawn while the round is open and kept
+secret; its `salt_sha256` is shown on the board and in the round view from then on, so the salt cannot be changed
+later to pick favourable scenes. Once the round is final (evaluated, and the crown kept or moved), the API publishes everything needed to check it at
+`GET /v1/skills/bin-picking/expert/rounds/<n>/verify` (404 until then): the salt and its commitment, the vector-env version and asset
 sha256 the scenes were made with, every scene's seed and state hash, and every evaluated image (the king's re-run
 and each challenger, by digest) with its score, rank and per-scene outcome and time.
 
 ```mermaid
 flowchart LR
-  S["salt (published after the round is final)"] --> SD["seed i = sha256(salt:n:i)[:6] + k"]
+  CM["salt_sha256 (shown while open)"] --> CK{"sha256(salt) = commitment?"}
+  S["salt (published after the round is final)"] --> CK
+  S --> SD["seed i = sha256(salt:n:i)[:6] + k"]
   SD --> G["vector-env: generate the scene"]
   G --> H{"seed and state hash = published?"}
   D["published results"] --> C{"scores, ranks, crown add up?"}
@@ -134,6 +137,9 @@ flowchart LR
 .venv/bin/vector-miner verify --round 12 --api https://vector.robotensor.ai --hash-scenes 100 \
   --image ghcr.io/<them>/bin-expert@sha256:<digest> --scenes 20 --pull
 
+# also compare the salt with the commitment you noted from the board while the round was open
+.venv/bin/vector-miner verify --round 12 --api https://vector.robotensor.ai --salt-sha256 <64 hex>
+
 # your own program in place of an image (no docker)
 .venv/bin/vector-miner verify --round 12 --api https://vector.robotensor.ai --image <digest> \
   --command "node example/solve.mjs" --scenes 5
@@ -141,13 +147,25 @@ flowchart LR
 
 - Seeds: scene `i` of round `n` uses `int.from_bytes(sha256(f"{salt}:{n}:{i}").digest()[:6], "big")`, which is
   vector-env's `scenes.seed_for(n, i, salt)`, plus `k`: the first `k` below `seed_tries` (6) whose draw places a
-  scene. `draw`, `task` and `wall_s` are the round's own settings.
+  scene. An index none of whose draws places a scene is listed in `skipped`; a full check (no `--hash-scenes`)
+  also confirms every skipped index fails here. `draw`, `task` and `wall_s` are the round's own settings.
+- The salt: `salt_sha256` must be the sha256 of the published salt, committed (`salt_committed_at`) no later than
+  the close (`closed_at`), and equal to `--salt-sha256` when given, else to the round view's `salt_sha256` when
+  the document comes from `--api`.
 - The document check: the seeds derive from the salt, `scenes_sha256` is
   `sha256("\n".join(f"{index}:{seed}:{state_hash}"))`, every score is successes / scenes, mean times match the
   successful scenes, ranks follow score, then mean time, then commit block, and a crown only went to a challenger
-  that beat the king's re-run by more than the margin.
-- Regeneration needs the same vector-env version and asset bundle as the round (`env` in the document); with
-  another one, the output warns and hashes can differ.
+  that beat the king's re-run by more than the margin; a decision that names a king needs that king's image, and
+  the winner is the best-ranked challenger that is not `infra_failed`. Each evaluated `run_image` must be
+  `ghcr.io/<repo>@sha256:<digest>` with the image's own `digest`; otherwise it is a document problem and `--image`
+  does not run (or pull) it.
+- Images that did not finish are listed under `unfinished`: status `stopped` or `infra_failed`, `stop_reason`,
+  how many scenes are `not_run`, `infra_failures`. A re-run skips the image's `not_run` scenes.
+- The document is read as strict JSON (no NaN), at most 64 MB, and every field is type-checked first.
+- Regeneration needs the same vector-env version and asset bundle as the round (`env` in the document, or a
+  scene's own `env` when it was made with another one); with another one, the output warns, and a scene whose
+  hash differs is listed under `unverified` (not as a mismatch). When the generator fails on every scene, including
+  a known published one (no node, a missing or broken asset bundle), the check stops with exit 2.
 - `--image` takes an evaluated image's reference, digest or hotkey. It runs that image's published `run_image` (the
   reference the round ran) on `--scenes` scenes sampled with `--sample-seed`, or `--command` instead, and reports
   `agreement` (same success), `outcome_agreement`, the time difference and every disagreeing scene. A different
@@ -156,9 +174,11 @@ flowchart LR
 - `--save FILE` keeps the document; `--doc FILE` checks a saved one offline. The output is one JSON object.
   Exit codes: 0 = the document adds up and every regenerated scene matches; 1 = a document problem or a scene
   mismatch (listed in the output); 2 = cannot check: a bad argument (`--command` without `--image`, no `--api`
-  without `--doc`, a `--doc` that is unreadable or of another round), the round is not final (404) or the API
-  failed, the image was not evaluated in the round, or vector-env is missing. Re-run disagreements are reported
-  under `rerun` and do not change the exit code.
+  without `--doc`, a `--doc` that is unreadable or of another round, `--workers` below 1, a malformed
+  `--salt-sha256`), a malformed, non-JSON or oversized document, the round is not final (404) or the API failed,
+  the image was not evaluated in the round, vector-env is missing or its generator does not work here, the pull
+  failed or the re-run could not run (docker missing, every scene an infra outcome), or scenes are `unverified`
+  (the output is printed). Re-run disagreements are reported under `rerun` and do not change the exit code.
 
 The example image (`example/Dockerfile`) runs as user 65534 with `HOME=/tmp` and writes nothing outside `/tmp`.
 Files your image reads must be readable by that user.
