@@ -530,3 +530,22 @@ def test_an_unexpected_error_still_exits_2(monkeypatch, capsys, env, tmp_path):
     monkeypatch.setattr(verify, "verify", boom)
     code, out, err = run(capsys, "--round", "4", "--doc", write(tmp_path, make_doc(fake_env(broken=env.scenes.broken))))
     assert code == 2 and "ZeroDivisionError" in err
+
+
+def test_the_genesis_team_expert_is_checked_but_not_rerunnable(capsys, env, tmp_path):
+    doc = make_doc(fake_env(broken=env.scenes.broken))
+    king = doc["images"][0]
+    king.update(team=True, image=None, run_image=None, digest=None)
+    p = write(tmp_path, doc)
+    code, out, err = run(capsys, "--round", "4", "--doc", p)
+    assert code == 0 and out["ok"] and out["document"]["problems"] == [], (out, err)
+    assert out["scenes"]["matched"] == 12
+    assert out["not_rerunnable"] == [{"role": "king", "hotkey": "5Hot0", "note": "team expert (not publicly re-runnable)"}]
+    code, out, err = run(capsys, "--round", "4", "--doc", p, "--image", "5Hot0")
+    assert code == 2 and "team expert (not publicly re-runnable)" in err
+    code, out, err = run(capsys, "--round", "4", "--doc", p, "--image", "5Hot0", "--command", "fake rate 0.3",
+                         "--hash-scenes", "2")
+    assert code == 0 and out["rerun"]["image"] == "king 5Hot0: team expert (not publicly re-runnable)"
+    king["score"] = 0.99
+    code, out, _ = run(capsys, "--round", "4", "--doc", write(tmp_path, doc), "--hash-scenes", "0")
+    assert code == 1 and any("king_score" in x for x in out["document"]["problems"])

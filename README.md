@@ -161,6 +161,9 @@ flowchart LR
   does not run (or pull) it.
 - Images that did not finish are listed under `unfinished`: status `stopped` or `infra_failed`, `stop_reason`,
   how many scenes are `not_run`, `infra_failures`. A re-run skips the image's `not_run` scenes.
+- An image without a published `run_image` is listed under `not_rerunnable`; the genesis king (the team's expert,
+  run as a command, `team: true`) shows as "team expert (not publicly re-runnable)". Its scenes, scores and the
+  decision are still checked; `--image` on it needs `--command`.
 - The document is read as strict JSON (no NaN), at most 64 MB, and every field is type-checked first.
 - Regeneration needs the same vector-env version and asset bundle as the round (`env` in the document, or a
   scene's own `env` when it was made with another one); with another one, the output warns, and a scene whose

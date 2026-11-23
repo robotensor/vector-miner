@@ -21,6 +21,7 @@ MAX_STR = 256
 ENV_KEYS = ("version", "assets_sha256")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 NOT_RUN = "not_run"
+TEAM_EXPERT = "team expert (not publicly re-runnable)"
 
 
 class VerifyError(Exception):
@@ -173,7 +174,7 @@ def validate(doc: dict) -> None:
         _int(im.get("successes"), f"{w}.successes", 0, MAX_SCENES, null=True)
         for f in ("score", "mean_time_s"):
             _num(im.get(f), f"{w}.{f}")
-        for f in ("winner", "crowned"):
+        for f in ("winner", "crowned", "team"):
             _flag(im.get(f), f"{w}.{f}")
         res = _obj(im.get("results"), f"{w}.results", null=False)
         for j, v in enumerate(_arr(res.get("success"), f"{w}.results.success", MAX_SCENES)):
@@ -216,7 +217,15 @@ def _rank_key(x: dict) -> tuple:
 
 
 def label(im: dict) -> str:
+    if im.get("team") and not im.get("run_image"):
+        return f"{im.get('role')} {im.get('hotkey')}: {TEAM_EXPERT}"
     return im.get("run_image") or im.get("image") or f"{im.get('role')} {im.get('hotkey')}"
+
+
+def not_rerunnable(doc: dict) -> list[dict]:
+    return [{"role": im.get("role"), "hotkey": im.get("hotkey"),
+             "note": TEAM_EXPERT if im.get("team") else "ran a program that is not published"}
+            for im in doc.get("images") or [] if not im.get("run_image")]
 
 
 def _salt_problems(doc: dict, expect: str | None, source: str) -> list[str]:
@@ -468,6 +477,7 @@ def verify(doc: dict, *, e: SimpleNamespace | None = None, hash_scenes: int | No
     if problems and doc.get("format") != FORMAT:
         out["ok"] = False
         return out
+    out["not_rerunnable"] = not_rerunnable(doc)
     out["unfinished"] = unfinished(doc)
     for x in out["unfinished"]:
         log(f"note: {x['role']} {x['image']} is {x['status']}: {x['not_run']} scenes not run"
@@ -476,7 +486,8 @@ def verify(doc: dict, *, e: SimpleNamespace | None = None, hash_scenes: int | No
     skip_rerun = None
     if im is not None and expert is None:
         if not im.get("run_image"):
-            raise VerifyError(f"{label(im)} ran a program that is not published; give --command to run your own")
+            what = "is the " + TEAM_EXPERT if im.get("team") else "ran a program that is not published"
+            raise VerifyError(f"{im.get('role')} {im.get('hotkey')} {what}; give --command to run your own")
         skip_rerun = pin_problem(im)
         if skip_rerun:
             log(f"warning: not running {label(im)}: {skip_rerun}")
