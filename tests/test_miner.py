@@ -83,14 +83,64 @@ def test_private_image_is_refused(monkeypatch):
     assert not ok and "public" in msg
 
 
+def _api(monkeypatch, handler):
+    monkeypatch.setattr(api_mod, "make_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def _subs(rows):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/skills/bin-picking/expert/submissions":
+            return httpx.Response(200, json={"submissions": [r for r in rows if r["hotkey"] == req.url.params["hotkey"]]})
+        return httpx.Response(404, json={"detail": "no"})
+    return handler
+
+
 def test_commit_sends_the_checked_reference(monkeypatch, capsys):
     sent = {}
     monkeypatch.setattr(cli, "_keypair", lambda a: Keypair.create_from_uri("//Alice"))
     monkeypatch.setattr(api_mod.Api, "dev_commit", lambda self, image: sent.setdefault("image", image) and {"block": 1})
+    _api(monkeypatch, _subs([{"hotkey": "5Other", "id": "s0", "status": "phase1"}]))
     assert cli.main(["commit", "--image", f"  {REF} ", "--no-check", "--dev-api", "http://api"]) == 0
     assert sent["image"] == REF
+    assert f"vector-miner serve --image {REF} --api http://api" in capsys.readouterr().err
     with pytest.raises(SystemExit, match="bad image reference"):
         cli.main(["commit", "--image", f"docker.io/alice/x@{D}", "--no-check", "--dev-api", "http://api"])
+
+
+@pytest.mark.parametrize("status", ["phase1", "below_king", "invalid", "abandoned"])
+def test_commit_refuses_a_hotkey_that_already_has_a_submission(monkeypatch, status):
+    alice = Keypair.create_from_uri("//Alice")
+    monkeypatch.setattr(cli, "_keypair", lambda a: alice)
+    monkeypatch.setattr(api_mod.Api, "dev_commit", lambda self, image: pytest.fail("committed"))
+    monkeypatch.setattr(chain, "commit", lambda *a: pytest.fail("committed on chain"))
+    rows = [{"hotkey": alice.ss58_address, "id": "sub-7", "image": REF, "status": status,
+             "committed_at": "2026-11-23T01:00:00+00:00"},
+            {"hotkey": alice.ss58_address, "id": "sub-9", "image": REF, "status": "duplicate_hotkey"}]
+    _api(monkeypatch, _subs(rows))
+    for argv in (["--dev-api", "http://api"], ["--netuid", "1", "--api", "http://api"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["commit", "--image", REF, "--no-check", *argv])
+        msg = str(e.value.code)
+        assert f"already has submission sub-7 ({REF}, status {status}" in msg
+        assert "one submission per hotkey, ever" in msg and "duplicate_hotkey" in msg and "new hotkey" in msg
+
+
+def test_commit_needs_the_api_check_or_its_opt_out(monkeypatch):
+    alice = Keypair.create_from_uri("//Alice")
+    monkeypatch.setattr(cli, "_keypair", lambda a: alice)
+    monkeypatch.delenv("VECTOR_MINER_API", raising=False)
+    with pytest.raises(SystemExit, match="--api .* is required: commit first checks"):
+        cli.main(["commit", "--image", REF, "--no-check", "--netuid", "1"])
+
+    def down(req):
+        raise httpx.ConnectError("refused")
+    _api(monkeypatch, down)
+    with pytest.raises(SystemExit, match="cannot reach http://api .*--no-api-check"):
+        cli.main(["commit", "--image", REF, "--no-check", "--netuid", "1", "--api", "http://api"])
+    sent = []
+    monkeypatch.setattr(chain, "commit", lambda net, netuid, kp, ref: sent.append((net, netuid, ref)) or {"ok": True})
+    assert cli.main(["commit", "--image", REF, "--no-check", "--netuid", "1", "--no-api-check", "--network", "test"]) == 0
+    assert sent == [("test", 1, REF)]
 
 
 def test_signed_request():
@@ -121,22 +171,51 @@ HERE = Path(__file__).resolve().parent
 HOT = Keypair.create_from_uri("//Alice").ss58_address
 
 
-def test_status_reads_the_public_board(monkeypatch, capsys):
+def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys):
+    rows = {HOT: [{"id": "sub-3", "hotkey": HOT, "image": REF, "status": "scored", "committed_at": "2026-11-23T01:00:00Z",
+                   "salt_sha256": "c" * 64, "phase1": {"done": 1000, "total": 1000, "score": 0.71}, "queue_position": 2}]}
+    king = {"hotkey": "5King", "best_score": 0.64}
+
     def handler(req: httpx.Request) -> httpx.Response:
         p = req.url.path
         if p == "/v1/skills/bin-picking/expert":
-            return httpx.Response(200, json={"king": {"hotkey": "5King", "score": 0.61}, "current": {"n": 4, "status": "open"},
-                                             "rounds": [{"n": 3}, {"n": 2}]})
-        if p.startswith("/v1/skills/bin-picking/expert/rounds/"):
-            n = int(p.rsplit("/", 1)[1])
-            return httpx.Response(200, json={"round": {"n": n}, "submissions": [
-                {"rank": 1, "hotkey": HOT, "score": 0.5 + n / 100, "status": "scored"}, {"rank": 2, "hotkey": "5Other"}]})
+            return httpx.Response(200, json={"king": king, "margin": 0.02})
+        if p == "/v1/skills/bin-picking/expert/submissions":
+            return httpx.Response(200, json={"submissions": rows.get(req.url.params["hotkey"], [])})
         return httpx.Response(404)
 
-    monkeypatch.setattr(api_mod, "make_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler)))
+    _api(monkeypatch, handler)
+    assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
+    cap = capsys.readouterr()
+    out = json.loads(cap.out)
+    s = out["submissions"][0]
+    assert out["king"] is False and out["king_best"] == 0.64 and out["margin"] == 0.02
+    assert s["phase1"] == {"done": 1000, "total": 1000, "score": 0.71, "successes": None} and s["queue_position"] == 2
+    assert "phase 2 queue position 2" in s["verdict"] and "sub-3: phase 1 done: 71.0 %" in cap.err
+    views = {
+        "waiting_connection": ({}, "run vector-miner serve"),
+        "phase1": ({"phase1": {"done": 412, "total": 1000}}, "412/1000 scenes"),
+        "below_king": ({"phase1": {"score": 0.6}}, "not above the king's best 64.0 %"),
+        "phase2": ({}, "every action hash must equal phase 1's"),
+        "king_run": ({"king_run": {"done": 300, "total": 1000}}, "king's image is running on your scenes (300/1000)"),
+        "crowned": ({"phase1": {"score": 0.71}, "king_run": {"score": 0.62}}, "crowned: 71.0 % against the king's 62.0 %"),
+        "not_crowned": ({"phase1": {"score": 0.71}, "king_run": {"score": 0.7}}, "not crowned"),
+        "disqualified": ({"reason": "action hash differs on 3 of 100 scenes"}, "action hash differs on 3 of 100"),
+        "abandoned": ({}, "no miner connection within 48 h"),
+    }
+    for st, (extra, want) in views.items():
+        rows[HOT] = [{"id": "sub-3", "hotkey": HOT, "status": st, **extra}]
+        assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
+        s = json.loads(capsys.readouterr().out)["submissions"][0]
+        assert want in s["verdict"], (st, s)
+        assert s["final"] == (st in ("below_king", "crowned", "not_crowned", "disqualified", "abandoned"))
+        if st == "king_run":
+            assert s["king_same_scenes"]["done"] == 300
+    king["hotkey"] = HOT
+    rows[HOT] = []
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert [s["round"] for s in out["submissions"]] == [4, 3, 2] and out["king"] is False and out["king_score"] == 0.61
+    assert out["king"] is True and out["submissions"] == [] and "vector-miner commit" in out["note"]
 
 
 def test_work_is_gone():
@@ -288,3 +367,56 @@ def test_setup_pins_vector_env_and_vector_sim(tmp_path):
     assert calls[0].startswith(f"git clone --depth 1 --branch v{env_ver} ") and calls[0].endswith("../vector-env")
     assert f"env-setup VECTOR_SIM_REF={sim_ref} VECTOR_ENV_JS_ONLY=1" in calls
     assert f"at {sim_ref}" in p.stderr and "assets: not installed yet" in p.stderr
+
+
+def _det_run(monkeypatch, hashes):
+    from vector_env import harness
+    _no_docker_scenes(monkeypatch)
+    calls = []
+
+    def run(ex, scs, **k):
+        calls.append([s["scene_id"] for s in scs])
+        n = len(calls) - 1
+        return [{"scene_id": s["scene_id"], "outcome": hashes[n][s["scene_id"]][1], "success": False, "t": 0.0, "n": 3,
+                 "wall_s": 1.0, "infra": hashes[n][s["scene_id"]][1] == "start_failed",
+                 "action_hash": hashes[n][s["scene_id"]][0]} for s in scs]
+    monkeypatch.setattr(harness, "run", run)
+    return calls
+
+
+def test_eval_determinism_runs_twice_and_compares_action_hashes(monkeypatch, capsys):
+    ids = [f"s{i}-0000000{i}" for i in range(3)]
+    same = {i: ("%016x" % k, "missed") for k, i in enumerate(ids)}
+    calls = _det_run(monkeypatch, [same, same])
+    assert cli.main(["eval", "--command", "true", "--determinism", "3"]) == 0
+    cap = capsys.readouterr()
+    out = json.loads(cap.out.strip().splitlines()[-1])
+    assert calls == [ids, ids[::-1]], "the second run goes in reverse order"
+    assert out["determinism"] == {"compared": 3, "equal": 3, "all_equal": True, "mismatched": [], "infra": 0}
+    assert "deterministic on 3 scenes" in cap.err
+    calls = _det_run(monkeypatch, [same, {**same, ids[1]: ("f" * 16, "missed")}])
+    assert cli.main(["eval", "--command", "true", "--determinism", "3"]) == 1
+    cap = capsys.readouterr()
+    assert json.loads(cap.out.strip().splitlines()[-1])["determinism"]["mismatched"] == [ids[1]]
+    assert "NOT deterministic: 1 of 3" in cap.err and "seed every random draw" in cap.err
+    _det_run(monkeypatch, [same, {**same, ids[2]: (None, "start_failed")}])
+    assert cli.main(["eval", "--command", "true", "--determinism", "3"]) == 2
+    assert "not a determinism result" in capsys.readouterr().err
+    with pytest.raises(SystemExit, match="at least 1"):
+        cli.main(["eval", "--command", "true", "--determinism", "0"])
+
+
+def test_eval_determinism_on_real_scenes(capsys):
+    pytest.importorskip("vector_env")
+    from vector_env import assets
+    if assets.find() is None:
+        pytest.skip(assets.MISSING)
+    base = f"{sys.executable} {HERE / 'fake_expert.py'}"
+    assert cli.main(["eval", "--command", f"{base} track 5", "--determinism", "2", "--seed", "3", "--workers", "2",
+                     "--time-limit", "3"]) == 0
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["determinism"]["all_equal"] and out["determinism"]["compared"] == 2
+    assert cli.main(["eval", "--command", f"{base} noisy 5", "--determinism", "2", "--seed", "3", "--workers", "2",
+                     "--time-limit", "3"]) == 1
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert len(out["determinism"]["mismatched"]) == 2
