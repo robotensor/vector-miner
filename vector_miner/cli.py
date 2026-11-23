@@ -102,20 +102,34 @@ def cmd_commit(a) -> int:
         from .api import Api
         r = Api(a.dev_api, kp).dev_commit(ref)
         print(json.dumps(r))
-        _next_steps(ref, a.dev_api)
+        _next_steps(ref, a.dev_api, _wallet_flags(a))
         return 0
     from .chain import commit
     r = commit(a.network, a.netuid, kp, ref)
     print(json.dumps(r))
     if r["ok"]:
-        _next_steps(ref, a.api)
+        _next_steps(ref, a.api, _wallet_flags(a))
     return 0 if r["ok"] else 1
 
 
-def _next_steps(ref: str, api: str | None) -> None:
+def _wallet_flags(a) -> str:
+    """The --wallet.* flags of this call that differ from the defaults, to repeat in the commands we print."""
+    out = []
+    if getattr(a, "wallet_name", "default") != "default":
+        out.append(f" --wallet.name {a.wallet_name}")
+    if getattr(a, "wallet_hotkey", "default") != "default":
+        out.append(f" --wallet.hotkey {a.wallet_hotkey}")
+    path = getattr(a, "wallet_path", DEFAULT_WALLETS)
+    if os.path.abspath(os.path.expanduser(path)) != os.path.abspath(DEFAULT_WALLETS):
+        out.append(f" --wallet.path {path}")
+    return "".join(out)
+
+
+def _next_steps(ref: str, api: str | None, wallet: str = "") -> None:
     where = f" --api {api}" if api else ""
     print(f"vector-miner: committed. Phase 1 starts when your miner connects (within 48 h): "
-          f"vector-miner serve --image {ref}{where}; follow it with vector-miner status{where}", file=sys.stderr)
+          f"vector-miner serve --image {ref}{where}{wallet}; follow it with vector-miner status{where}{wallet}",
+          file=sys.stderr)
 
 
 def cmd_status(a) -> int:

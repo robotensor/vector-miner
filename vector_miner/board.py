@@ -48,8 +48,8 @@ def verdict(s: dict, king: dict, margin: float | None) -> str:
         return (f"phase 1 scored {_pct(p1['score'])}, not above the king's best {_pct(best)} + margin {m:g}: "
                 "no phase 2, final")
     if st == "phase2" and s.get("stage") == "copy":
-        return ("phase 2 starts: we copy your committed image into our registry first (keep it public until then; "
-                "a deleted image is disqualified)")
+        return ("phase 2 starts: we copy your committed image into our registry first (keep it pullable until then: "
+                "public, or shared with the team account; a deleted image is disqualified)")
     if st == "phase2":
         return "phase 2: we run your committed image in docker (--network none) on 100 of your scenes; every action hash must equal phase 1's"
     if st == "king_run" and s.get("stage") == "decisive":

@@ -347,7 +347,7 @@ vector-miner verify --submission ID (--api URL | --doc FILE) [--save FILE] [--ha
   The subnet would record a second commit as `duplicate_hotkey` and never evaluate it. To submit another image, register another hotkey. When the API cannot be reached `commit` stops;
   `--no-api-check` skips the check (the testnet trial). The same digest, or the same image layers under another
   digest, as an earlier submission of another hotkey is a `copy`.
-- After a commit, `commit` prints the `serve` command to start; phase 1 waits for it at most 48 h.
+- After a commit, `commit` prints the `serve` and `status` commands to run next (with the `--api` and `--wallet.*` flags you gave); phase 1 waits for `serve` at most 48 h.
 
 ### Inspect a failure
 

@@ -102,7 +102,13 @@ def test_commit_sends_the_checked_reference(monkeypatch, capsys):
     _api(monkeypatch, _subs([{"hotkey": "5Other", "id": "s0", "status": "phase1"}]))
     assert cli.main(["commit", "--image", f"  {REF} ", "--no-check", "--dev-api", "http://api"]) == 0
     assert sent["image"] == REF
-    assert f"vector-miner serve --image {REF} --api http://api" in capsys.readouterr().err
+    assert f"vector-miner serve --image {REF} --api http://api;" in capsys.readouterr().err
+    assert cli.main(["commit", "--image", REF, "--no-check", "--dev-api", "http://api", "--wallet.name", "cold",
+                     "--wallet.hotkey", "hk1", "--wallet.path", "/w"]) == 0
+    err = capsys.readouterr().err
+    assert (f"vector-miner serve --image {REF} --api http://api --wallet.name cold --wallet.hotkey hk1 "
+            "--wallet.path /w;") in err
+    assert "vector-miner status --api http://api --wallet.name cold --wallet.hotkey hk1 --wallet.path /w" in err
     with pytest.raises(SystemExit, match="bad image reference"):
         cli.main(["commit", "--image", f"docker.io/alice/x@{D}", "--no-check", "--dev-api", "http://api"])
 
