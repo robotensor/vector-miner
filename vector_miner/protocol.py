@@ -42,3 +42,12 @@ def commitment_info(data: str) -> dict:
     if not 0 < len(b) <= MAX_LEN:
         raise BadImage(f"a commitment holds 1..{MAX_LEN} bytes")
     return {"fields": [{f"Raw{len(b)}": "0x" + b.hex()}]}
+
+
+def connect_message(image: str, nonce: str) -> bytes:
+    return f"vector-connect\n{image}\n{nonce}".encode()
+
+
+def hello(keypair, image: str, nonce: str) -> dict:
+    return {"type": "hello", "hotkey": keypair.ss58_address, "image": image, "nonce": nonce,
+            "signature": keypair.sign(connect_message(image, nonce)).hex()}

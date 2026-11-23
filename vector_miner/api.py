@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 
 import httpx
 
@@ -76,20 +77,25 @@ class Api:
     def round_verify(self, n: int, max_bytes: int) -> bytes:
         return self.get_bytes(f"/v1/skills/{SKILL}/expert/rounds/{int(n)}/verify", max_bytes)
 
-    def status(self, hotkey: str, rounds: int = 3) -> dict:
-        ex = self.expert()
-        cur = (ex.get("current") or {}).get("n")
-        nums = [cur] if cur is not None else []
-        nums += [r["n"] for r in ex.get("rounds") or [] if r.get("n") != cur]
-        out = []
-        for n in nums[:rounds]:
-            rd = self.round(n)
-            for s in rd.get("submissions") or []:
-                if s.get("hotkey") == hotkey:
-                    out.append({"round": n, **s})
-        king = ex.get("king") or {}
-        return {"hotkey": hotkey, "king": king.get("hotkey") == hotkey, "king_score": king.get("score"),
-                "current": ex.get("current"), "submissions": out}
+    def nonce(self) -> str:
+        j = self.get("/v1/expert/nonce")
+        n = j.get("nonce") if isinstance(j, dict) else None
+        if not isinstance(n, str) or not n:
+            raise ApiError(200, "the nonce response has no nonce")
+        return n
+
+    def submissions(self, hotkey: str) -> list[dict]:
+        j = self.get(f"/v1/skills/{SKILL}/expert/submissions?hotkey={quote(hotkey, safe='')}")
+        rows = j.get("submissions") if isinstance(j, dict) else j
+        if not isinstance(rows, list):
+            raise ApiError(200, "the submissions response has no submissions list")
+        return [x for x in rows if isinstance(x, dict) and x.get("hotkey") in (None, hotkey)]
+
+    def submission(self, sid: str) -> dict:
+        return self.get(f"/v1/skills/{SKILL}/expert/submissions/{quote(str(sid), safe='')}")
+
+    def submission_verify(self, sid: str, max_bytes: int) -> bytes:
+        return self.get_bytes(f"/v1/skills/{SKILL}/expert/submissions/{quote(str(sid), safe='')}/verify", max_bytes)
 
     def dev_commit(self, image: str) -> dict:
         return self.post_signed("/v1/dev/commit", {"image": image})
