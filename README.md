@@ -1,8 +1,9 @@
 # vector-miner
 
 Miner tools for the Vector subnet's expert competition. You write an expert: a program that picks the target part
-out of a bin, step by step, over the `vector-expert/2` protocol (see vector-env). Evaluation is continuous: you
-commit one image, once per hotkey, and its evaluation starts as soon as your miner connects.
+out of a bin, step by step, over the `vector-expert/2` protocol (see vector-env). You commit one image, once per
+hotkey; phase 1 starts as soon as your miner connects, and the rest of the evaluation runs after the end of the round
+in which phase 1 ended.
 
 ```mermaid
 flowchart LR
@@ -15,7 +16,8 @@ flowchart LR
   F --> SV["vector-miner serve: your machine plays 1,000 fresh scenes (phase 1)"]
   SV --> SC["phase-1 score"]
   SC -->|"not above the king's best + margin"| BK["below_king (final)"]
-  SC -->|"above"| Q["phase-2 queue, highest score first"]
+  SC -->|"above"| RE["waits for the end of its round (the round its phase 1 ended in)"]
+  RE --> Q["the round's evaluation: older rounds first, then highest phase-1 score, one at a time"]
   Q --> CP["the subnet copies your image into its registry"]
   CP -->|"the image is gone (deleted, or private and not shared)"| DQ["disqualified"]
   CP --> P2["phase 2: the copy runs in docker on 100 of the scenes"]
@@ -34,7 +36,12 @@ flowchart LR
 On commit the subnet makes a secret salt for your submission and publishes its `salt_sha256`; the 1,000 scenes
 are drawn from that salt. Phase 1 is played on your machine: `vector-miner serve` dials out to the subnet, our
 simulator plays every scene against your image step by step, and each scene's rows are hashed (the action hash).
-When your submission reaches the head of the phase-2 queue, the subnet first copies your committed image into its
+The subnet runs in rounds (one schedule for miners and contributors; the length is a subnet setting, shown with its
+dates in `GET /v1/skills/bin-picking/expert` as `round`). Your submission belongs to the round in which its phase 1
+ends. A phase-1 score not above the king's best + margin is `below_king` at once; the others wait until their round
+ends, and then that round's evaluation runs while the next round already runs: older rounds first, then the highest
+phase-1 score, one submission at a time, each checked against the king's best again when its turn comes. The subnet
+keeps your phase-1 scenes and results for this. When your submission's turn comes, the subnet first copies your committed image into its
 own registry (until then keep the image public, or private and shared with the subnet's team account with Read
 access: an image the subnet cannot pull then is `disqualified`, "image no longer available"); everything after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of
 those scenes: every action hash must equal phase 1's, or the submission is disqualified. Then the king's image plays
@@ -263,7 +270,8 @@ flowchart TD
 One JSON object: `king` (whether you are the king), `king_hotkey`, `king_image` (null for the genesis king, which
 runs as a command: `king_note` then says `king: no image published`), `king_best`, `margin`, and `submissions`, each
 with `id`, `image`, `status`, `committed_at`, `salt_sha256`, `phase1 {done, total, score, successes}`,
-`queue_position` (phase-2 queue, highest phase-1 score first), `phase2`, `king_same_scenes {hotkey, image, done,
+`round` (the round its phase 1 ended in), `evaluates_at` (when that round ends, while it is ahead),
+`queue_position` (evaluation order: older round first, then highest phase-1 score), `phase2`, `king_same_scenes {hotkey, image, done,
 total, score}` (the king's run on your scenes), `reason`, `retry_at`, `final` and `verdict` (one line, also printed
 to stderr).
 It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`.
@@ -272,7 +280,7 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 |---|---|
 | `waiting_connection` | committed; run `serve` (abandoned after 48 h without any connection attempt; a refusal because every slot is busy counts as an attempt) |
 | `phase1` | `serve` is playing your scenes: `phase1.done` of `phase1.total`. After the first hour on the socket it must keep up 200 scenes an hour on average (8 at once do ≥ 640), or the rest count as failures and the slot goes to the next miner |
-| `scored` | phase 1 is done and above the king's best + margin: in the phase-2 queue (`queue_position`) |
+| `scored` | phase 1 is done and above the king's best + margin: waits for its round to end (`evaluates_at`), then for its turn in the evaluation (`queue_position`) |
 | `below_king` | phase 1 is not above the king's best + margin; final. A queued submission is re-checked after every crowning |
 | `phase2` | `stage` `copy`: we copy your image into our registry; then we run the copy in docker on 100 of your scenes and compare action hashes |
 | `king_run` | phase 2 passed; the king's image plays all your scenes; `stage` `decisive`: the decisive re-check (`decisive {done, total}`) |

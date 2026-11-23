@@ -208,7 +208,11 @@ def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys
     s = out["submissions"][0]
     assert out["king"] is False and out["king_best"] == 0.64 and out["margin"] == 0.02
     assert s["phase1"] == {"done": 1000, "total": 1000, "score": 0.71, "successes": None} and s["queue_position"] == 2
-    assert "phase 2 queue position 2" in s["verdict"] and "sub-3: phase 1 done: 71.0 %" in cap.err
+    assert "evaluation queue position 2" in s["verdict"] and "sub-3: phase 1 done: 71.0 %" in cap.err
+    rows[HOT][0].update(round=3, evaluates_at="2026-11-30T00:00:00+00:00")
+    assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
+    s = json.loads(capsys.readouterr().out)["submissions"][0]
+    assert s["round"] == 3 and "round 3 ends at 2026-11-30T00:00:00+00:00, then its evaluation" in s["verdict"]
     assert out["king_image"] is None and out["king_note"] == "king: no image published"
     assert "vector-miner: king: no image published" in cap.err
     views = {

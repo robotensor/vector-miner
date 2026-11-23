@@ -36,11 +36,14 @@ def verdict(s: dict, king: dict, margin: float | None) -> str:
     if st == "phase1":
         return f"phase 1: {p1['done'] or 0}/{p1['total'] or 1000} scenes played against your miner; keep serve running"
     if st == "scored":
-        q = s.get("queue_position")
+        q, rnd, at = s.get("queue_position"), s.get("round"), s.get("evaluates_at")
         line = f"phase 1 done: {_pct(p1['score'])}"
         if best is not None:
             line += f"; it beats the king's best {_pct(best)} by more than the margin {m:g}"
-        return line + (f"; phase 2 queue position {q}" if q is not None else "; waiting for phase 2")
+        if at:
+            return line + (f"; round {rnd} ends at {at}, then its evaluation (phase 2, the king's run) starts"
+                           + (f"; evaluation order {q}" if q is not None else ""))
+        return line + (f"; evaluation queue position {q}" if q is not None else "; waiting for its evaluation")
     if st == "below_king":
         return (f"phase 1 scored {_pct(p1['score'])}, not above the king's best {_pct(best)} + margin {m:g}: "
                 "no phase 2, final")
@@ -86,6 +89,7 @@ def verdict(s: dict, king: dict, margin: float | None) -> str:
 def view(s: dict, king: dict, margin: float | None) -> dict:
     return {"id": s.get("id"), "image": s.get("image"), "status": s.get("status"),
             "committed_at": s.get("committed_at"), "salt_sha256": s.get("salt_sha256"), "phase1": phase1(s),
+            "round": s.get("round"), "evaluates_at": s.get("evaluates_at"),
             "queue_position": s.get("queue_position"), "phase2": s.get("phase2"), "king_same_scenes": king_same(s),
             "stage": s.get("stage"), "decisive": s.get("decisive"),
             "reason": s.get("reason"), "retry_at": s.get("retry_at"), "final": s.get("status") in FINAL,
