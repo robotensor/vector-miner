@@ -163,6 +163,65 @@ def test_eval_runs_the_local_harness(capsys, tmp_path):
     assert out["score"] == out["successes"] / 2 and out["successes"] >= 1, out
     for i, r in enumerate(res):
         assert r["wall_s"] < wall and r["outcome"] != "wall_timeout", r
-        sc = scenes.generate(scenes.seed_for(1, i))
-        rp = harness.replay(sc, r["ctrl"], r["n"], time_limit_s=out["time_limit_s"])
+        sc, _ = scenes.draw_index(1, i)
+        rp = harness.replay(sc, r["ctrl"], r["n"], time_limit_s=out["time_limit_s"], result=r)
         assert (rp["outcome"], rp["success"], rp["t"]) == (r["outcome"], r["success"], r["t"])
+
+
+def test_status_and_commit_without_a_wallet(tmp_path):
+    for argv in (["status", "--api", "http://api"], ["commit", "--image", REF, "--no-check", "--netuid", "1"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main([*argv, "--wallet.path", str(tmp_path), "--wallet.name", "miner"])
+        msg = str(e.value.code)
+        assert msg.startswith("vector-miner: no wallet hotkey miner/default in ") and "btcli wallet new_hotkey" in msg
+        assert ("--hotkey" in msg) == (argv[0] == "status")
+
+
+def test_status_unreachable_api_is_one_line(monkeypatch, capsys):
+    def handler(req):
+        raise httpx.ConnectError("refused")
+    monkeypatch.setattr(api_mod, "make_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler)))
+    assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 2
+    assert capsys.readouterr().err.startswith("vector-miner: cannot reach http://api")
+
+
+def _no_docker_scenes(monkeypatch):
+    from vector_env import cli as env_cli
+    scs = [{"scene_id": f"s{i}-0000000{i}", "seed": i, "xml": "<mujoco/>", "meta": {"parts": [1]}, "checkpoint": "",
+            "state_hash": str(i) * 8, "target": 1} for i in range(3)]
+    monkeypatch.setattr(env_cli, "draw_scenes", lambda n, seed, draw=None, log=None: (scs[:n], []))
+
+
+def test_eval_image_without_docker_is_an_infra_error(monkeypatch, capsys, tmp_path):
+    _no_docker_scenes(monkeypatch)
+    assert cli.main(["eval", "--image", "ghcr.io/a/b:1", "--docker", str(tmp_path / "none"), "--scenes", "3"]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == "" and '"score"' not in cap.err
+    line = cap.err.strip().splitlines()[-1]
+    assert line.startswith("vector-miner: no scene ran here (docker_unavailable") and "--command" in line
+
+
+def test_eval_pull_without_docker_is_one_line(monkeypatch, capsys, tmp_path):
+    _no_docker_scenes(monkeypatch)
+    assert cli.main(["eval", "--image", "ghcr.io/a/b:1", "--pull", "--docker", str(tmp_path / "none")]) == 2
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and err[0].startswith("vector-miner: cannot pull ghcr.io/a/b:1: no docker binary")
+
+
+def test_eval_skips_like_the_round(monkeypatch, capsys):
+    from vector_env import harness, scenes
+    from vector_env.compose import SceneError
+    bad = {scenes.seed_for(2, 0) + k for k in range(scenes.SEED_TRIES)}
+
+    def gen(seed, draw):
+        if seed in bad:
+            raise SceneError("no part in the bin is visible enough to be a target")
+        return {"scene_id": f"s{seed}", "seed": seed, "meta": {"parts": [1]}}
+    monkeypatch.setattr(scenes, "generate", gen)
+    monkeypatch.setattr(harness, "run", lambda ex, scs, **k: [
+        {"scene_id": s["scene_id"], "outcome": "success", "success": True, "t": 3.0, "n": 60, "wall_s": 1.0,
+         "infra": False} for s in scs])
+    assert cli.main(["eval", "--command", "true", "--scenes", "3", "--seed", "2"]) == 0
+    cap = capsys.readouterr()
+    out = json.loads(cap.out)
+    assert out["skipped"] == [0] and out["scenes"] == 2 and out["score"] == 1.0 and "Traceback" not in cap.err

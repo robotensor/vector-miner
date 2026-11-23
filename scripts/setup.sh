@@ -6,7 +6,7 @@ if [ ! -d "$ENV_DIR/vector_env" ]; then
   git clone --depth 1 --branch "${VECTOR_ENV_REF:-main}" "${VECTOR_ENV_GIT:-https://github.com/robotensor/vector-env}" "$ENV_DIR"
 fi
 if [ ! -d "$ENV_DIR/js/node_modules" ]; then
-  "$ENV_DIR/scripts/setup.sh"
+  VECTOR_ENV_JS_ONLY=1 "$ENV_DIR/scripts/setup.sh"
 fi
 if command -v uv >/dev/null 2>&1; then
   uv venv --allow-existing .venv --python "${PYTHON:-3.12}"
@@ -26,4 +26,7 @@ if [ -d ../vector-sim/js ]; then
   (cd example && npm ci --no-audit --no-fund)
 else
   echo "example: no vector-sim beside this folder or beside $ENV_DIR; clone it to ../vector-sim, then (cd example && npm ci)" >&2
+fi
+if ! err=$(.venv/bin/vector-env assets pull 2>&1 >/dev/null); then
+  echo "assets: not installed yet (${err#vector-env: }); set VECTOR_ENV_ASSETS_SOURCE (hf://<repo> or a folder) or VECTOR_ENV_BUNDLE, then .venv/bin/vector-env assets pull" >&2
 fi

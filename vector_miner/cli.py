@@ -10,10 +10,16 @@ import sys
 from .protocol import BadImage, parse_image
 
 
-def _keypair(a):
+def _keypair(a, alt: str = ""):
     from bittensor_wallet import Wallet
+    from bittensor_wallet.errors import KeyFileError
     w = Wallet(name=a.wallet_name, hotkey=a.wallet_hotkey, path=a.wallet_path)
-    return w.hotkey
+    try:
+        return w.hotkey
+    except KeyFileError:
+        raise SystemExit(f"vector-miner: no wallet hotkey {a.wallet_name}/{a.wallet_hotkey} in {a.wallet_path}: "
+                         f"{alt}pass --wallet.name/--wallet.hotkey (and --wallet.path), or create one with "
+                         f"btcli wallet new_coldkey and btcli wallet new_hotkey") from None
 
 
 def cmd_commit(a) -> int:
@@ -40,16 +46,28 @@ def cmd_commit(a) -> int:
 
 
 def cmd_status(a) -> int:
-    from .api import Api
-    hotkey = a.hotkey or _keypair(a).ss58_address
-    print(json.dumps(Api(a.api).status(hotkey, a.rounds), indent=1))
+    import httpx
+
+    from .api import Api, ApiError
+    hotkey = a.hotkey or _keypair(a, "pass --hotkey <ss58>, or ").ss58_address
+    try:
+        out = Api(a.api).status(hotkey, a.rounds)
+    except ApiError as e:
+        print(f"vector-miner: {a.api}: {e}", file=sys.stderr)
+        return 2
+    except httpx.HTTPError as e:
+        print(f"vector-miner: cannot reach {a.api}: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(out, indent=1))
     return 0
 
 
 def cmd_eval(a) -> int:
     try:
         from vector_env import harness
-        from vector_env.cli import evaluate
+        from vector_env.cli import EvalError, evaluate, report
+        from vector_env.compose import SceneError
+        from vector_env.node import SimError
     except ImportError:
         raise SystemExit("vector-miner eval needs vector-env (scripts/setup.sh installs it)") from None
     if a.command:
@@ -61,19 +79,21 @@ def cmd_eval(a) -> int:
         raise SystemExit("give --image REF or --command \"...\"")
     docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
     if a.image and a.pull:
-        harness.pull(a.image, docker)
+        try:
+            harness.docker_check(docker)
+            harness.pull(a.image, docker)
+        except harness.HarnessError as e:
+            hint = "; --pull and --image need a running docker daemon" if e.outcome == "docker_unavailable" else ""
+            print(f"vector-miner: cannot pull {a.image}: {e}{hint}", file=sys.stderr)
+            return 2
     from vector_env.assets import AssetsError
     try:
-        r = evaluate(expert, a.scenes, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall, docker=docker)
-    except AssetsError as e:
+        r = evaluate(expert, a.scenes, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall, docker=docker,
+                     stderr_dir=a.stderr)
+    except (AssetsError, EvalError, SceneError, SimError, harness.HarnessError, ValueError) as e:
         print(f"vector-miner: {e}", file=sys.stderr)
         return 2
-    if a.results:
-        with open(a.results, "w") as f:
-            for x in r["results"]:
-                f.write(json.dumps(x, separators=(",", ":")) + "\n")
-    print(json.dumps(r["summary"]))
-    return 0
+    return report(r, a.results, "vector-miner")
 
 
 def _verify_args(a) -> str | None:
@@ -194,6 +214,7 @@ def main(argv=None) -> int:
     e.add_argument("--docker", help="the docker binary")
     e.add_argument("--pull", action="store_true")
     e.add_argument("--results", help="write the per-scene results here (JSON lines)")
+    e.add_argument("--stderr", metavar="DIR", help="write the expert's stderr of every scene to DIR/<index>-<scene_id>.log")
     v = sub.add_parser("verify", help="re-check a final round: regenerate its scenes from the published salt, "
                                       "check the results, optionally re-run an evaluated image")
     v.add_argument("--round", type=int, required=True)
