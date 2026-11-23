@@ -10,10 +10,27 @@ from .protocol import BadImage, parse_image
 from .verify import (MAX_SCENES, VerifyError, _arr, _bad, _env, _flag, _int, _num, _obj, _str, _time, base_seed,
                      scenes_digest)
 
+try:
+    from vector_env.rules import INFRA_OUTCOMES
+except ImportError:
+    INFRA_OUTCOMES = ("harness_error", "scene_error", "docker_unavailable", "image_missing", "pull_failed", "start_failed")
+
 FORMAT = "vector-submission-verify/1"
 SEED_N = 0
 FINAL = ("below_king", "crowned", "not_crowned", "disqualified")
 HASH = re.compile(r"^[0-9a-f]{16}$")
+INFRA = frozenset(INFRA_OUTCOMES)
+NOT_RUN = "not_run"
+GENESIS_KING = "king: no image published"
+
+
+def is_infra(outcome, success) -> bool:
+    return not success and (outcome in INFRA or not outcome)
+
+
+def phase2_sample(salt: str, idxs: list[int], k: int) -> list[int]:
+    ranked = sorted(idxs, key=lambda i: hashlib.sha256(f"{salt}:phase2:{int(i)}".encode()).hexdigest())
+    return sorted(ranked[:max(0, int(k))])
 
 
 def _hash(v, where: str) -> None:
@@ -31,6 +48,11 @@ def _results(res: dict, where: str) -> None:
         _str(v, f"{where}.outcome[{j}]", 64)
     for j, v in enumerate(_arr(res.get("action_hash"), f"{where}.action_hash", MAX_SCENES)):
         _hash(v, f"{where}.action_hash[{j}]")
+
+
+def _ints(v, where: str) -> None:
+    for j, x in enumerate(_arr(v, where, MAX_SCENES, null=True)):
+        _int(x, f"{where}[{j}]", 0, 2 * MAX_SCENES)
 
 
 def _who(v: dict, where: str) -> None:
@@ -70,7 +92,8 @@ def validate(doc: dict) -> None:
     p1 = _obj(doc.get("phase1"), "phase1", null=False)
     _num(p1.get("score"), "phase1.score")
     _num(p1.get("mean_time_s"), "phase1.mean_time_s")
-    _int(p1.get("successes"), "phase1.successes", 0, MAX_SCENES, null=True)
+    for f in ("successes", "counted", "infra"):
+        _int(p1.get(f), f"phase1.{f}", 0, MAX_SCENES, null=True)
     _results(_obj(p1.get("results"), "phase1.results", null=False), "phase1.results")
     p2 = _obj(doc.get("phase2"), "phase2")
     if p2:
@@ -80,6 +103,10 @@ def validate(doc: dict) -> None:
             _int(v, f"phase2.scenes[{j}]", 0, 2 * MAX_SCENES)
         for j, v in enumerate(_arr(p2.get("action_hash"), "phase2.action_hash", MAX_SCENES)):
             _hash(v, f"phase2.action_hash[{j}]")
+        for j, v in enumerate(_arr(p2.get("outcome"), "phase2.outcome", MAX_SCENES)):
+            _str(v, f"phase2.outcome[{j}]", 64)
+        for f in ("mismatched", "wall_timeouts"):
+            _ints(p2.get(f), f"phase2.{f}")
         for j, v in enumerate(_arr(p2.get("wall_s"), "phase2.wall_s", MAX_SCENES)):
             _num(v, f"phase2.wall_s[{j}]")
     k = _obj(doc.get("king"), "king")
@@ -90,7 +117,9 @@ def validate(doc: dict) -> None:
         _int(k.get("successes"), "king.successes", 0, MAX_SCENES, null=True)
         _results(_obj(k.get("results"), "king.results", null=False), "king.results")
     dec = _obj(doc.get("decision"), "decision")
-    _num(dec.get("king_best"), "decision.king_best")
+    for f in ("king_best", "king_score", "score"):
+        _num(dec.get(f), f"decision.{f}")
+    _int(dec.get("compared"), "decision.compared", 0, MAX_SCENES, null=True)
     _str(dec.get("king"), "decision.king")
     for f in ("phase2_ran", "beats_king", "crowned"):
         _flag(dec.get(f), f"decision.{f}")
@@ -138,19 +167,63 @@ def _salt_problems(doc: dict, expect: str | None, source: str, allow_uncommitted
     return bad
 
 
-def _score(name: str, part: dict, count: int) -> list[str]:
-    res, bad = part["results"], []
+def _lengths(name: str, part: dict, count: int) -> list[str]:
+    res = part["results"]
     if any(len(res.get(k) or []) != count for k in ("success", "t", "outcome", "action_hash")):
         return [f"{name}: {count} results expected (success, t, outcome, action_hash)"]
-    ok = sum(1 for v in res["success"] if v)
-    if part.get("successes") is not None and ok != part["successes"]:
-        bad.append(f"{name}: {part['successes']} successes published, {ok} in the results")
-    if part.get("score") is None or abs(float(part["score"]) - ok / max(1, count)) > 1e-9:
-        bad.append(f"{name}: score {part.get('score')} is not {ok}/{count}")
+    return []
+
+
+def _times(name: str, part: dict) -> list[str]:
+    res = part["results"]
     ts = [float(t) for v, t in zip(res["success"], res["t"]) if v and t is not None]
     if ts and part.get("mean_time_s") is not None and abs(statistics.fmean(ts) - float(part["mean_time_s"])) > 1e-3:
-        bad.append(f"{name}: mean time {part['mean_time_s']} is not the mean of its successful scenes")
-    return bad
+        return [f"{name}: mean time {part['mean_time_s']} is not the mean of its successful scenes"]
+    return []
+
+
+def _near(a, b) -> bool:
+    return a is not None and abs(float(a) - float(b)) <= 1e-9
+
+
+def _verdict(res: dict, k: int) -> bool:
+    return not is_infra(res["outcome"][k], res["success"][k])
+
+
+def _score(name: str, part: dict, count: int) -> list[str]:
+    bad = _lengths(name, part, count)
+    if bad:
+        return bad
+    res = part["results"]
+    ok = sum(1 for v in res["success"] if v)
+    counted = sum(1 for k in range(count) if _verdict(res, k))
+    infra = count - counted
+    if part.get("successes") is not None and ok != part["successes"]:
+        bad.append(f"{name}: {part['successes']} successes published, {ok} in the results")
+    if part.get("counted") is not None and part["counted"] != counted:
+        bad.append(f"{name}: {part['counted']} scenes counted published, {counted} with a verdict in the results")
+    if part.get("infra") is not None and part["infra"] != infra:
+        bad.append(f"{name}: {part['infra']} infrastructure failures published, {infra} in the results")
+    if not _near(part.get("score"), ok / max(1, counted)):
+        left = f" ({infra} infrastructure failures left out)" if infra else ""
+        bad.append(f"{name}: score {part.get('score')} is not {ok}/{counted}{left}")
+    return bad + _times(name, part)
+
+
+def same_scenes(doc: dict) -> dict | None:
+    p1, king = doc["phase1"]["results"], doc.get("king") or None
+    count = len(doc["scenes"])
+    if _lengths("phase 1", doc["phase1"], count) or (king is not None and _lengths("king run", king, count)):
+        return None
+    kr = king["results"] if king else None
+    pairs = [k for k in range(count) if _verdict(p1, k) and (kr is None or (
+        kr["outcome"][k] != NOT_RUN and _verdict(kr, k)))]
+    n = len(pairs)
+    c_ok = sum(1 for k in pairs if p1["success"][k])
+    k_ok = sum(1 for k in pairs if kr["success"][k]) if kr is not None else 0
+    return {"compared": n, "left_out": count - n, "successes": c_ok, "score": c_ok / n if n else 0.0,
+            "king_successes": k_ok if kr is not None else None,
+            "king_score": (k_ok / n if n else 0.0) if kr is not None else None}
 
 
 def phase2_check(doc: dict) -> dict | None:
@@ -159,22 +232,84 @@ def phase2_check(doc: dict) -> dict | None:
         return None
     pos = {x["index"]: k for k, x in enumerate(doc["scenes"])}
     idx, hs, ws = p2.get("scenes") or [], p2.get("action_hash") or [], p2.get("wall_s") or []
+    outs = p2.get("outcome") or []
     pub = (doc["phase1"]["results"].get("action_hash") or [])
     cap = doc.get("wall_s")
-    mism, over, unknown = [], [], []
+    mism, over, unknown, infra = [], [], [], []
     for j, i in enumerate(idx):
         if i not in pos or pos[i] >= len(pub):
             unknown.append(i)
             continue
-        h = hs[j] if j < len(hs) else None
-        if h is None or h != pub[pos[i]]:
+        o = outs[j] if j < len(outs) else None
+        if o == NOT_RUN or is_infra(o, False):
+            infra.append(i)
+            continue
+        h, p = (hs[j] if j < len(hs) else None), pub[pos[i]]
+        if p is None or h != p:
             mism.append(i)
         w = ws[j] if j < len(ws) else None
-        if cap is not None and (w is None or float(w) > float(cap)):
+        if o == "wall_timeout" or (cap is not None and float(w or 0.0) > float(cap)):
             over.append(i)
-    return {"scenes": len(idx), "equal": len(idx) - len(mism) - len(unknown), "mismatched": mism,
-            "over_wall": over, "unknown": unknown, "passed": bool(idx) and not mism and not over and not unknown,
+    n = len(idx) - len(unknown) - len(infra)
+    return {"scenes": len(idx), "compared": n, "equal": n - len(mism), "mismatched": mism, "over_wall": over,
+            "infra": infra, "unknown": unknown, "passed": n > 0 and not mism and not over and not unknown,
             "status": p2.get("status"), "reason": p2.get("reason")}
+
+
+def _sample_problems(doc: dict, p2: dict) -> list[str]:
+    res, rows = doc["phase1"]["results"], doc["scenes"]
+    if len(res.get("action_hash") or []) != len(rows) or len(res.get("outcome") or []) != len(rows):
+        return []
+    ok = [x["index"] for k, x in enumerate(rows)
+          if res["action_hash"][k] and res["outcome"][k] != NOT_RUN and _verdict(res, k)]
+    got = doc["phase2"].get("scenes") or []
+    want = phase2_sample(doc["salt"], ok, len(got))
+    if got != want:
+        return [f"phase 2 ran on other scenes than the sample rule picks from the {len(ok)} phase-1 verdicts "
+                f"(the {len(got)} smallest sha256(salt:phase2:index), sorted: {want[:10]})"]
+    return []
+
+
+def _king(king: dict, count: int, dec: dict, warnings: list) -> list[str]:
+    bad = _lengths("king run", king, count)
+    if bad:
+        return bad
+    ok = sum(1 for v in king["results"]["success"] if v)
+    if king.get("successes") is not None and ok != king["successes"]:
+        bad.append(f"king run: {king['successes']} successes published, {ok} in the results")
+    bad += _times("king run", king)
+    why = pin_problem(king)
+    if why and king.get("image") is None and king.get("id") is None:
+        warnings.append(f"{GENESIS_KING} (the genesis king runs as a command; its run cannot be repeated here)")
+    elif why:
+        bad.append(f"king: {why}")
+    if dec.get("king") is not None and dec["king"] != king.get("hotkey"):
+        bad.append(f"the decision's king is {dec['king']}, the king run is {king.get('hotkey')}")
+    return bad
+
+
+def _decision(doc: dict, st: str, margin: float) -> list[str]:
+    same, king, dec = same_scenes(doc), doc.get("king") or None, doc.get("decision") or {}
+    if same is None:
+        return []
+    bad, n, cs, ks = [], same["compared"], same["score"], same["king_score"]
+    if king is not None and not _near(king.get("score"), ks):
+        bad.append(f"king run: score {king.get('score')} is not {same['king_successes']}/{n}, its successes on the "
+                   "scenes where both runs gave a verdict")
+    if dec.get("score") is not None and not _near(dec["score"], cs):
+        bad.append(f"decision.score {dec['score']} is not {same['successes']}/{n}, the phase-1 successes on the scenes "
+                   "where both runs gave a verdict")
+    if dec.get("compared") is not None and dec["compared"] != n:
+        bad.append(f"decision.compared {dec['compared']} is not {n}, the scenes where both runs gave a verdict")
+    if dec.get("king_score") is not None and (ks is None or not _near(dec["king_score"], ks)):
+        bad.append(f"decision.king_score {dec['king_score']} is not the king run's {ks}")
+    beats = n > 0 and cs > (ks or 0.0) + margin
+    if beats != bool(dec.get("beats_king")):
+        bad.append(f"beats_king should be {beats}")
+    if (st == "crowned") != beats:
+        bad.append(f"{st}, but {cs} against the king's {ks or 0.0} + margin {margin} on the same {n} scenes says "
+                   f"{'crowned' if beats else 'not_crowned'}")
+    return bad
 
 
 def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str = "you gave",
@@ -229,33 +364,31 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
                 bad.append(f"phase 2 names scenes that are not in the list: {p2['unknown'][:10]}")
             if len(set(doc["phase2"].get("scenes") or [])) != p2["scenes"]:
                 bad.append("phase 2 repeats a scene")
-            if any(len(doc["phase2"].get(k) or []) != p2["scenes"] for k in ("action_hash", "wall_s")):
-                bad.append("phase 2 needs one action_hash and one wall_s per scene")
+            if any(len(doc["phase2"].get(k) or []) != p2["scenes"] for k in ("outcome", "action_hash", "wall_s")):
+                bad.append("phase 2 needs one outcome, one action_hash and one wall_s per scene")
+            bad += _sample_problems(doc, p2)
+            for f, mine in (("mismatched", p2["mismatched"]), ("wall_timeouts", p2["over_wall"])):
+                have = doc["phase2"].get(f)
+                if have is not None and sorted(have) != sorted(mine):
+                    bad.append(f"phase2.{f} {sorted(have)[:10]} is not {sorted(mine)[:10]}, the recomputed list "
+                               f"(infrastructure failures left out: {p2['infra'][:10]})")
             if st == "disqualified" and p2["passed"]:
                 bad.append("disqualified, but every phase-2 action hash equals phase 1's and every scene fits wall_s")
             if st == "disqualified" and not (doc["phase2"].get("reason") or sub.get("reason")):
                 bad.append("disqualified without a reason")
             if st in ("crowned", "not_crowned") and not p2["passed"]:
                 bad.append(f"{st}, but phase 2 did not pass (mismatched {p2['mismatched'][:10]}, "
-                           f"over the wall {p2['over_wall'][:10]})")
+                           f"over the wall {p2['over_wall'][:10]}, compared {p2['compared']})")
         if st == "disqualified" and king is not None:
             bad.append("disqualified, but a king run is published")
         if st in ("crowned", "not_crowned"):
-            if king is None:
+            no_king = king is None and dec.get("king") is None and dec.get("king_score") is None
+            if king is None and not no_king:
                 bad.append(f"{st}, but no king run on the same scenes is published")
             else:
-                bad += _score("king run", king, count)
-                why = pin_problem(king)
-                if why:
-                    bad.append(f"king: {why}")
-                if dec.get("king") is not None and dec["king"] != king.get("hotkey"):
-                    bad.append(f"the decision's king is {dec['king']}, the king run is {king.get('hotkey')}")
-                beats = score > float(king.get("score") or 0.0) + margin
-                if beats != bool(dec.get("beats_king")):
-                    bad.append(f"beats_king should be {beats}")
-                if (st == "crowned") != beats:
-                    bad.append(f"{st}, but the phase-1 score {score} against the king's {king.get('score')} "
-                               f"+ margin {margin} on the same scenes says {'crowned' if beats else 'not_crowned'}")
+                if king is not None:
+                    bad += _king(king, count, dec, warnings)
+                bad += _decision(doc, st, margin)
     if bool(dec.get("crowned")) != (st == "crowned"):
         bad.append("decision.crowned disagrees with the status")
     return bad
@@ -272,7 +405,7 @@ def pick(doc: dict, ref: str | None) -> tuple[str, dict]:
         keys = {who.get("image"), who.get("digest"), who.get("hotkey"), who.get("id"), role}
         if ref in keys or (who.get("digest") and ref.endswith("@" + who["digest"])):
             return role, who
-    have = ", ".join(x.get("image") or "?" for x in (sub, king) if x) or "none"
+    have = ", ".join(x.get("image") or "no image published" for x in (sub, king) if x) or "none"
     raise VerifyError(f"{ref} did not run for submission {sub.get('id')} (ran: {have})")
 
 
@@ -334,12 +467,13 @@ def verify(doc: dict, *, e=None, hash_scenes: int | None = None, image: str | No
         out["ok"] = False
         return out
     out["phase2"] = phase2_check(doc)
+    out["same_scenes"] = same_scenes(doc) if out["status"] in ("crowned", "not_crowned") else None
     role, who = pick(doc, image) if image or expert else ("submission", None)
     skip_rerun = None
     if who is not None and expert is None:
         skip_rerun = pin_problem(who)
         if skip_rerun:
-            log(f"warning: not running the {role} image: {skip_rerun}")
+            log(f"warning: {role}: {skip_rerun}; not re-running it")
         else:
             expert = {"image": who["image"]}
     e = e or rv.load_env()
@@ -358,7 +492,12 @@ def verify(doc: dict, *, e=None, hash_scenes: int | None = None, image: str | No
     idx = sorted(x["index"] for x in doc["scenes"])
     count = len(idx)
     order = [idx[j] for j in rv.sample_order(count, sample_seed)]
-    pick_idx = order[:max(0, int(rerun_scenes))] if who is not None else []
+    pick_idx = []
+    if who is not None:
+        res, pos = who.get("results") or doc["phase1"]["results"], {x["index"]: k for k, x in enumerate(doc["scenes"])}
+        n = min(len(res.get(k) or []) for k in ("success", "outcome", "action_hash"))
+        ran = [i for i in order if pos[i] < n and res["action_hash"][pos[i]] is not None and _verdict(res, pos[i])]
+        pick_idx = ran[:max(0, int(rerun_scenes))]
     m = count if hash_scenes is None else min(count, max(0, int(hash_scenes)))
     g = rv.regenerate(doc, e, sorted(set(order[:m]) | set(pick_idx)), log=log, local=local,
                       skipped=sorted(doc.get("skipped") or []) if m == count else [], n=SEED_N)

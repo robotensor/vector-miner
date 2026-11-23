@@ -42,16 +42,25 @@ def fake_env(**kw) -> SimpleNamespace:
     return SimpleNamespace(scenes=Scenes(**kw), harness=Harness(), wall_s=45.0)
 
 
-def _part(e, ref, made, count):
+def _part(e, ref, made, infra=()):
     got = e.harness.run({"image": ref}, made, time_limit_s=15, wall_s=45)
+    for k in infra:
+        got[k] = {"success": False, "t": None, "outcome": "harness_error", "action_hash": None}
     succ = [int(r["success"]) for r in got]
     ok = [r["t"] for r in got if r["success"]]
-    return {"score": sum(succ) / count, "successes": sum(succ), "mean_time_s": statistics.fmean(ok) if ok else None,
+    counted = len(got) - len(infra)
+    return {"score": sum(succ) / max(1, counted), "successes": sum(succ), "counted": counted, "infra": len(infra),
+            "mean_time_s": statistics.fmean(ok) if ok else None,
             "results": {"success": succ, "t": [r["t"] for r in got], "outcome": [r["outcome"] for r in got],
-                        "action_hash": [r["action_hash"] for r in got]}}
+                        "action_hash": [r["action_hash"] for r in got],
+                        "rows_sent": [None if k in infra else 40 for k in range(len(got))]}}
 
 
-def make_doc(e, status="crowned", count=12, king_best=0.4):
+def _sample(ok, k=6):
+    return sorted(sorted(ok, key=lambda i: hashlib.sha256(f"{SALT}:phase2:{i}".encode()).hexdigest())[:k])
+
+
+def make_doc(e, status="crowned", count=12, king_best=0.4, p1_infra=(), p2_infra=0, king_infra=(), genesis=False):
     rows, made, skipped = [], [], []
     for i in range(count):
         sc = None
@@ -65,37 +74,59 @@ def make_doc(e, status="crowned", count=12, king_best=0.4):
             skipped.append(i)
             continue
         made.append(sc)
-        rows.append({"index": i, "seed": sc["seed"], "state_hash": sc["state_hash"]})
+        rows.append({"index": i, "seed": sc["seed"], "state_hash": sc["state_hash"], "parts": 6})
     count = len(rows)
-    p1 = _part(e, SUB, made, count)
+    p1 = _part(e, SUB, made, p1_infra)
     if status == "below_king":
         king_best = p1["score"]
-    sample = [x["index"] for x in rows][::2]
+    res = p1["results"]
     pos = {x["index"]: k for k, x in enumerate(rows)}
-    p2 = None if status == "below_king" else {
-        "status": "failed" if status == "disqualified" else "passed",
-        "reason": "the action hash differs on 1 of 6 scenes" if status == "disqualified" else None,
-        "scenes": sample, "action_hash": [p1["results"]["action_hash"][pos[i]] for i in sample],
-        "wall_s": [12.5 for _ in sample]}
-    if status == "disqualified":
-        p2["action_hash"][1] = "0" * 16
-    king = None
+    sample = _sample([x["index"] for k, x in enumerate(rows) if k not in p1_infra])
+    p2 = None
+    if status != "below_king":
+        p2 = {"status": "failed" if status == "disqualified" else "passed",
+              "reason": "1 of 6 phase-2 scenes gave other actions than in phase 1" if status == "disqualified" else None,
+              "scenes": sample, "outcome": [res["outcome"][pos[i]] for i in sample],
+              "action_hash": [res["action_hash"][pos[i]] for i in sample], "wall_s": [12.5 for _ in sample],
+              "mismatched": [], "wall_timeouts": [], "sample_rule": "..."}
+        for j in range(p2_infra):
+            p2["outcome"][j], p2["action_hash"][j], p2["wall_s"][j] = "docker_unavailable", None, None
+        if status == "disqualified" and p2_infra + 1 < len(sample):
+            p2["action_hash"][p2_infra + 1] = "0" * 16
+            p2["mismatched"] = [sample[p2_infra + 1]]
+    king, left = None, set(p1_infra)
     if status in ("crowned", "not_crowned"):
-        king = {"hotkey": "5Kate", "image": KING, "digest": "sha256:" + "c" * 64, **_part(e, KING, made, count)}
+        part = _part(e, KING, made, king_infra)
         if status == "not_crowned":
-            king = {**king, **{k: p1[k] for k in ("score", "successes", "mean_time_s", "results")}}
-    beats = king is not None and p1["score"] > king["score"] + 0.02
+            part = {k: p1[k] for k in ("score", "successes", "mean_time_s", "results")}
+        else:
+            left |= set(king_infra)
+        king = {"id": None if genesis else "sub-7", "hotkey": "5Kate", "team": genesis,
+                "image": None if genesis else KING, "source_image": None if genesis else KING,
+                "digest": None if genesis else "sha256:" + "c" * 64, "status": "king", "reason": None,
+                **{k: part[k] for k in ("score", "successes", "mean_time_s", "results")}}
+    pairs = [k for k in range(count) if k not in left]
+    n = len(pairs)
+    cs = sum(res["success"][k] for k in pairs) / n
+    ks = sum(king["results"]["success"][k] for k in pairs) / n if king else None
+    if king:
+        king["score"] = ks
+    beats = king is not None and cs > ks + 0.02
     return {"format": subverify.FORMAT, "skill": "bin-picking",
-            "submission": {"id": SID, "hotkey": "5Alice", "image": SUB, "digest": "sha256:" + "a" * 64,
-                           "status": status, "reason": p2["reason"] if status == "disqualified" else None,
-                           "committed_at": "2026-11-23T01:00:00+00:00", "finished_at": "2026-11-23T09:00:00+00:00"},
+            "submission": {"id": SID, "hotkey": "5Alice", "uid": 4, "image": SUB, "digest": "sha256:" + "a" * 64,
+                           "commit_block": 100, "status": status,
+                           "reason": p2["reason"] if status == "disqualified" else None,
+                           "committed_at": "2026-11-23T01:00:00+00:00", "scored_at": "2026-11-23T05:00:00+00:00",
+                           "finished_at": "2026-11-23T09:00:00+00:00"},
             "salt": SALT, "salt_sha256": hashlib.sha256(SALT.encode()).hexdigest(),
             "salt_committed_at": "2026-11-23T01:00:01+00:00", "phase1_started_at": "2026-11-23T01:05:00+00:00",
-            "seed_rule": "...", "seed_tries": 6, "skipped": skipped, "draw": None, "task": {"time_limit_s": 15.0},
-            "wall_s": 45.0, "step_deadline_s": 2.0, "env": dict(ENV), "scene_count": count,
-            "scenes_sha256": verify.scenes_digest(rows), "scenes": rows, "margin": 0.02, "phase1": p1, "phase2": p2,
-            "king": king, "decision": {"king": "5Kate", "king_best": king_best, "phase2_ran": p2 is not None,
-                                       "beats_king": beats, "crowned": status == "crowned"}}
+            "seed_rule": "...", "seed_tries": 6, "skipped": skipped, "draw": None,
+            "task": {"time_limit_s": 15.0, "human_factor": 2.0}, "wall_s": 45.0, "step_deadline_s": 2.0,
+            "max_restarts": 2, "margin": 0.02, "env": dict(ENV), "scene_count": count,
+            "scenes_sha256": verify.scenes_digest(rows), "scenes": rows, "phase1": p1, "phase2": p2, "king": king,
+            "decision": {"king_best": king_best, "king": "5Kate", "phase2_ran": p2 is not None,
+                         "king_score": ks if king else None, "score": cs if king else None,
+                         "compared": n if king else None, "beats_king": beats, "crowned": status == "crowned"}}
 
 
 BROKEN = {verify.base_seed(SALT, 0, 2) + k for k in range(6)}
@@ -260,3 +291,55 @@ def test_a_changed_scene_hash_is_a_mismatch(capsys, env, tmp_path):
 def test_the_seed_rule_is_vector_envs():
     se = pytest.importorskip("vector_env.scenes")
     assert verify.base_seed(SALT, subverify.SEED_N, 7) == se.seed_for(0, 7, SALT)
+
+
+def test_infrastructure_failures_are_left_out_as_the_server_does(capsys, env, tmp_path):
+    plain = make_doc(fake_env(broken=BROKEN))
+    pos = {x["index"]: k for k, x in enumerate(plain["scenes"])}
+    full = _sample(list(pos))
+    p1_infra = (pos[full[0]], pos[full[2]])
+    doc = make_doc(fake_env(broken=BROKEN), "crowned", p1_infra=p1_infra, p2_infra=1, king_infra=(pos[full[4]],))
+    count, p1, p2 = doc["scene_count"], doc["phase1"], doc["phase2"]
+    assert p1["infra"] == 2 and p1["counted"] == count - 2 and p1["score"] == p1["successes"] / (count - 2)
+    assert full[0] not in p2["scenes"] and p2["outcome"][0] == "docker_unavailable"
+    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
+    assert code == 0 and out["ok"] and out["document"]["problems"] == [], out["document"]
+    assert out["phase2"]["infra"] == [p2["scenes"][0]] and out["phase2"]["compared"] == len(p2["scenes"]) - 1
+    assert out["phase2"]["passed"] and out["same_scenes"]["compared"] == count - 3 == doc["decision"]["compared"]
+    assert out["same_scenes"]["score"] == doc["decision"]["score"]
+    assert out["same_scenes"]["king_score"] == doc["king"]["score"] == doc["decision"]["king_score"]
+    old = {"phase1": p1["successes"] / count,
+           "king": sum(doc["king"]["results"]["success"]) / count,
+           "sample": _sample(list(pos))}
+    for fn, problem in ((_set(["phase1", "score"], old["phase1"]), "2 infrastructure failures left out"),
+                        (_set(["king", "score"], old["king"]), "king run: score"),
+                        (_set(["phase2", "scenes"], old["sample"]), "other scenes than the sample rule picks"),
+                        (_set(["phase1", "infra"], 0), "0 infrastructure failures published, 2 in the results"),
+                        (_set(["decision", "compared"], count), f"is not {count - 3}"),
+                        (_set(["phase2", "mismatched"], [p2["scenes"][0]]), "infrastructure failures left out")):
+        code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, _t(doc, fn)), "--hash-scenes", "0")
+        assert code == 1 and any(problem in p for p in out["document"]["problems"]), (problem, out["document"])
+    code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--image", SUB, "--scenes", "50",
+                       "--hash-scenes", "0")
+    assert code == 0 and out["rerun"]["scenes"] == count - 2 == out["rerun"]["hash_equal"], out["rerun"]
+
+
+def test_a_phase2_that_only_hit_infrastructure_is_no_pass(capsys, env, tmp_path):
+    doc = make_doc(fake_env(broken=BROKEN), "disqualified", p2_infra=6)
+    assert doc["phase2"]["mismatched"] == [] and set(doc["phase2"]["outcome"]) == {"docker_unavailable"}
+    code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
+    assert code == 0 and out["phase2"]["compared"] == 0 and not out["phase2"]["passed"], out
+
+
+def test_the_genesis_king_has_no_image(capsys, env, tmp_path):
+    p = write(tmp_path, make_doc(fake_env(broken=BROKEN), "crowned", genesis=True))
+    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--hash-scenes", "0")
+    assert code == 0 and out["ok"] and out["document"]["problems"] == [], out["document"]
+    assert out["document"]["warnings"][0].startswith("king: no image published") and "warning: king: no image" in err
+    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", "king", "--scenes", "3", "--hash-scenes", "0")
+    assert code == 0 and out["rerun"] == {"role": "king", "image": None, "skipped": "no image published"}, out
+    assert "king: no image published; not re-running it" in err
+    doc = make_doc(fake_env(broken=BROKEN), "crowned", genesis=True)
+    doc["king"]["id"] = "sub-7"
+    code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
+    assert code == 1 and "king: no image published" in out["document"]["problems"], out["document"]

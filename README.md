@@ -222,7 +222,8 @@ flowchart TD
 .venv/bin/vector-miner status --api https://vector.robotensor.ai --wallet.name <coldkey> --wallet.hotkey <hotkey>
 ```
 
-One JSON object: `king` (whether you are the king), `king_hotkey`, `king_best`, `margin`, and `submissions`, each
+One JSON object: `king` (whether you are the king), `king_hotkey`, `king_image` (null for the genesis king, which
+runs as a command: `king_note` then says `king: no image published`), `king_best`, `margin`, and `submissions`, each
 with `id`, `image`, `status`, `committed_at`, `salt_sha256`, `phase1 {done, total, score, successes}`,
 `queue_position` (phase-2 queue, highest phase-1 score first), `phase2`, `king_same_scenes {hotkey, image, done,
 total, score}` (the king's run on your scenes), `reason`, `final` and `verdict` (one line, also printed to stderr).
@@ -239,7 +240,8 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 | `crowned` / `not_crowned` | your phase-1 score against the king's on the same scenes, with the margin; final |
 | `disqualified` | phase 2 found another action hash or a scene over the wall (`reason`); final |
 | `duplicate_hotkey` | a second commit from a hotkey that already had one; never evaluated |
-| `invalid` / `copy` / `abandoned` | a bad commit, the digest of an earlier submission, no connection within 48 h |
+| `invalid` / `copy` | a bad commit, the digest of an earlier submission; neither uses the hotkey's submission, so it may commit again |
+| `abandoned` | no connection within 48 h; final, and it used the hotkey's submission |
 
 ## Commands
 
@@ -280,9 +282,9 @@ vector-miner verify --round N ...            # a weekly round from before v8 (sa
   a registry that answers another digest is refused (`--no-check` skips this). The reference is committed without
   surrounding spaces.
 - One submission per hotkey, ever. `commit` asks the public API
-  (`GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`) first and refuses when the hotkey already has a
-  submission, whatever its status: the subnet would record a second commit as `duplicate_hotkey` and never
-  evaluate it. To submit another image, register another hotkey. When the API cannot be reached `commit` stops;
+  (`GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`) first and refuses when the hotkey's submission is
+  used: any earlier commit except an `invalid`, `copy` or `duplicate_hotkey` one, which the subnet does not count.
+  The subnet would record a second commit as `duplicate_hotkey` and never evaluate it. To submit another image, register another hotkey. When the API cannot be reached `commit` stops;
   `--no-api-check` skips the check (the testnet trial). The same digest as an earlier submission is a `copy`.
 - After a commit, `commit` prints the `serve` command to start; phase 1 waits for it at most 48 h.
 
@@ -344,18 +346,24 @@ flowchart LR
   `salt_committed_at` (or `phase1_started_at`) is a document problem (exit 1); `--allow-uncommitted` lists it under
   `document.warnings` instead and checks the rest.
 - The document check: the seeds derive from the salt, `scenes_sha256` is
-  `sha256("\n".join(f"{index}:{seed}:{state_hash}"))`, the phase-1 and king scores are successes / scenes and
-  their mean times match the successful scenes; `below_king` needs a phase-1 score not above `decision.king_best` +
-  `margin` and no phase 2; any other final status needs one above it and a phase 2 on scenes of the list, each once,
-  with an action hash and a wall time; `disqualified` needs a phase-2 hash that differs from phase 1's (or a scene
-  over `wall_s`) and a reason; `crowned` and `not_crowned` need phase 2 passed and a king run, and `crowned` exactly
-  when the phase-1 score is above the king run's score + `margin`. Images must be `ghcr.io/<repo>@sha256:<digest>`
-  with their own `digest`.
+  `sha256("\n".join(f"{index}:{seed}:{state_hash}"))`, the phase-1 score is successes / scenes with a verdict
+  (infrastructure failures, an `INFRA_OUTCOMES` outcome or none, are left out; `not_run` and timeouts count as
+  failures), mean times match the successful scenes; `below_king` needs a phase-1 score not above
+  `decision.king_best` + `margin` and no phase 2; any other final status needs one above it and a phase 2 on the
+  sample rule's scenes (the smallest `sha256(f"{salt}:phase2:{index}")` among the phase-1 verdicts with an action
+  hash), each with an outcome, an action hash and a wall time; phase-2 infrastructure failures are left out of the
+  comparison, and it passes when at least one scene is compared, every hash equals phase 1's and no scene is a
+  `wall_timeout` or over `wall_s`; `disqualified` needs a phase 2 that did not pass and a reason; `crowned` and
+  `not_crowned` need phase 2 passed and a king run, whose score and `decision.score` are successes on the scenes
+  where both runs gave a verdict, and `crowned` exactly when the submission's is above the king's + `margin` there.
+  Images must be `ghcr.io/<repo>@sha256:<digest>` with their own `digest`; the genesis king (no `id`) runs as a
+  command and has no image: a warning `king: no image published`, and `--image king` skips the re-run.
 - `--image` takes `submission`, `king`, or that image's reference, digest or hotkey; it runs the image (or
-  `--command` instead) on `--scenes` scenes sampled with `--sample-seed` and reports `hash_equal`,
-  `hash_agreement`, `outcome_agreement` and every scene whose action hash differs. A deterministic image gives the
-  published hashes on any machine. Re-run differences do not change the exit code.
-- `phase2` in the output repeats the phase-2 comparison: `equal`, `mismatched`, `over_wall`, `passed`.
+  `--command` instead) on `--scenes` scenes with a published verdict, sampled with `--sample-seed`, and reports
+  `hash_equal`, `hash_agreement`, `outcome_agreement` and every scene whose action hash differs. A deterministic
+  image gives the published hashes on any machine. Re-run differences do not change the exit code.
+- `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched`, `over_wall`, `infra`,
+  `passed`; `same_scenes` repeats the decision: `compared`, `score`, `king_score`.
 - Regeneration, `--save`, `--doc`, strict JSON, the size limit and the exit codes are as for a round, below; a
   `--doc` of another submission, an image that did not run for the submission, or giving both or neither of
   `--submission` and `--round` exit 2.
