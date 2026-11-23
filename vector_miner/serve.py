@@ -24,7 +24,7 @@ from .protocol import hello
 
 CONNECT = "/v1/expert/connect"
 MAX_LINE = 1 << 20
-MAX_MESSAGE = 64 << 20
+MAX_MESSAGE = 4 << 20
 OPEN_TIMEOUT_S = 10.0
 END_GRACE_S = 2.0
 IDLE_S = 300.0
@@ -287,7 +287,9 @@ class Bridge:
     def __init__(self, pool: Pool, concurrency: int, log=_log, idle_s: float = IDLE_S, timing: bool = False):
         self.pool, self.log, self.idle_s = pool, log, idle_s
         self.timing: dict[str, dict] | None = {} if timing else None
-        self.sem = asyncio.Semaphore(max(1, int(concurrency)))
+        self.concurrency = max(1, int(concurrency))
+        self.sem = asyncio.Semaphore(self.concurrency)
+        self.refused = 0
         self.ended = 0
         self.outcomes: collections.Counter = collections.Counter()
         self.experts: dict[str, Expert] = {}
@@ -297,6 +299,7 @@ class Bridge:
     async def connection(self, ws, on_message=None) -> str:
         out: asyncio.Queue = asyncio.Queue()
         scenes: dict[str, tuple[asyncio.Queue, asyncio.Task]] = {}
+        ended: set[str] = set()
 
         async def writer() -> None:
             while True:
@@ -322,17 +325,40 @@ class Bridge:
                     on_message(m)
                 t, key = m.get("type"), m.get("scene_key")
                 if isinstance(key, str) and t == "start":
-                    if key not in scenes or scenes[key][1].done():
-                        q: asyncio.Queue = asyncio.Queue()
-                        scenes[key] = (q, asyncio.ensure_future(self.scene(key, m, q, out, time.monotonic())))
+                    for k in [k for k, (_, task) in scenes.items() if task.done()]:
+                        scenes.pop(k, None)
+                        ended.discard(k)
+                    if key in scenes:
+                        continue
+                    idx = key.split(".")[0]
+                    for k in [k for k in scenes if k.split(".")[0] == idx]:
+                        scenes.pop(k)[1].cancel()
+                        ended.discard(k)
+                    if sum(1 for k in scenes if k not in ended) >= self.concurrency:
+                        self.refused += 1
+                        out.put_nowait({"type": "error", "scene_key": key,
+                                        "error": f"this miner runs at most {self.concurrency} scenes at once "
+                                                 f"(vector-miner serve --concurrency {self.concurrency})"})
+                        if self.refused in (1, 10, 100) or self.refused % 1000 == 0:
+                            self.log(f"refused scene {key}: {self.concurrency} scenes already run "
+                                     f"({self.refused} refused so far; raise --concurrency)")
+                        continue
+                    q: asyncio.Queue = asyncio.Queue()
+                    scenes[key] = (q, asyncio.ensure_future(self.scene(key, m, q, out, time.monotonic())))
                 elif isinstance(key, str) and t in ("state", "end"):
                     if key in scenes and not scenes[key][1].done():
                         scenes[key][0].put_nowait(m)
+                        if t == "end":
+                            ended.add(key)
                 elif t == "done":
                     self.done = m
                     return "done"
                 elif t == "welcome":
                     self.log(_welcome(m))
+                    want = _num(m.get("concurrency"))
+                    if want is not None and want > self.concurrency:
+                        self.log(f"warning: the server runs {want:g} scenes at once and this miner {self.concurrency}: "
+                                 f"start serve with --concurrency {want:g} or the extra scenes fail")
                 elif t == "error" and key is None:
                     self.log(f"the server says: {_says(m)}")
         finally:

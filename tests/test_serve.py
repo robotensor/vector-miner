@@ -219,7 +219,8 @@ def test_concurrency_and_warm_pool_give_a_fresh_process_per_scene(pids):
 
     async def script(ws, srv):
         r = Router(ws)
-        await asyncio.gather(*(r.play(i, f"{i}.0") for i in range(5)))
+        for j in range(0, 5, 2):
+            await asyncio.gather(*(r.play(i, f"{i}.0") for i in range(j, min(j + 2, 5))))
         await ws.send(json.dumps({"type": "done"}))
 
     async def main():
@@ -237,6 +238,40 @@ def test_concurrency_and_warm_pool_give_a_fresh_process_per_scene(pids):
     assert len(ends) == 5 and len({p.name for p in ends}) == 5
     assert seen["max"] <= 4, seen
     assert not any(alive(p) for p in pids_of(pids))
+
+
+def test_starts_past_the_concurrency_are_refused(pids):
+    got, logs = {}, []
+
+    async def script(ws, srv):
+        r = Router(ws)
+        await ws.send(json.dumps({"type": "welcome", "submission": "sub-1", "concurrency": 8}))
+        for i in range(2):
+            await ws.send(json.dumps(start_msg(i, f"{i}.0")))
+        for i in range(2, 40):
+            await ws.send(json.dumps(start_msg(i, f"{i}.0")))
+        for i in range(2, 40):
+            got[f"{i}.0"] = await asyncio.wait_for(r.box(f"{i}.0").get(), 10)
+        for i in range(2):
+            m = await asyncio.wait_for(r.box(f"{i}.0").get(), 10)
+            got[f"{i}.0"] = m
+            await ws.send(json.dumps({"type": "end", "scene_key": f"{i}.0", "outcome": "missed", "t": 1.0, "tick": 5}))
+        await asyncio.sleep(0.3)
+        await r.play(5, "5.1")
+        await ws.send(json.dumps({"type": "done"}))
+
+    async def main():
+        async with FakeServer(script) as srv:
+            return await sv.serve(srv.api, REF, KP, sv.Launcher(expert()), concurrency=2, warm=0, backoff=FAST,
+                                  log=logs.append)
+
+    assert run(main()) == 0
+    assert all(got[f"{i}.0"]["type"] == "act" for i in range(2)), got
+    assert all(got[f"{i}.0"]["type"] == "error" and "at most 2 scenes at once" in got[f"{i}.0"]["error"]
+               for i in range(2, 40))
+    assert any("the server runs 8 scenes at once and this miner 2" in x for x in logs)
+    assert sum("refused scene" in x for x in logs) <= 3
+    assert sv.MAX_MESSAGE == 4 << 20
 
 
 def test_expert_failures_are_reported_to_the_server(pids):
@@ -642,3 +677,22 @@ def test_a_review_at_the_end_of_phase1_waits_for_retry_at(pids):
     assert code == 0 and srv.conns == 2, logs
     assert any("the server says: notice: just saying" in x for x in logs), logs
     assert any("phase 1 runs again from " + soon in x and "keep serve running" in x for x in logs), logs
+
+
+def test_a_newer_restart_of_a_scene_replaces_the_older_one(pids):
+    got = {}
+
+    async def script(ws, srv):
+        r = Router(ws)
+        await ws.send(json.dumps(start_msg(0, "0.0")))
+        await asyncio.wait_for(r.box("0.0").get(), 10)
+        await r.play(0, "0.1", got=got)
+        await r.play(1, "1.0", got=got)
+        await ws.send(json.dumps({"type": "done"}))
+
+    async def main():
+        async with FakeServer(script) as srv:
+            return await sv.serve(srv.api, REF, KP, sv.Launcher(expert()), concurrency=1, warm=0, backoff=FAST)
+
+    assert run(main()) == 0
+    assert len(got["0.1"]) == 15 and len(got["1.0"]) == 15, got
