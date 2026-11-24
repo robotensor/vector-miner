@@ -41,7 +41,8 @@ simulator plays every scene against your image step by step, and each scene's ro
 The subnet runs in rounds (one schedule for miners and contributors; the length is a subnet setting, shown with its
 dates in `GET /v1/skills/bin-picking/expert` as `round`). Your submission belongs to the round in which its phase 1
 ends. Phase 1 alone ranks the scripts: the bar is the king's phase-1 score + `margin` (0), so a score must be
-higher than the king's, and before the first round decision there is no king and no bar (every score counts). A
+higher than the king's, and before the first round decision there is no king and no bar. Any score must be above
+`expert.min_score` (0: at least one scene solved) to rank. A
 phase-1 score not above the bar is `below_king` at once; the others wait until their round ends, and then that
 round's evaluation runs while the next round already runs: in commit order (older round first, then the earlier
 commit block), one submission at a time, each checked against the bar again when its turn comes. The subnet keeps
@@ -427,7 +428,7 @@ flowchart LR
   `sha256("\n".join(f"{index}:{seed}:{state_hash}"))`, the phase-1 score is successes / scenes with a verdict
   (infrastructure failures, an `INFRA_OUTCOMES` outcome or none, are left out; `not_run` and timeouts count as
   failures), mean times match the successful scenes; `below_king` needs a phase-1 score not above
-  `decision.bar` (a null bar: no king, every score counts) and no phase 2; any other final status needs one above it
+  `decision.bar` (a null bar: no king, any score above the minimum counts) and no phase 2; any other final status needs one above it
   and a phase 2 on the
   sample rule's scenes: the `phase2_scenes` (the submission's own, 100 by default) indexes with the smallest `sha256(f"{salt}:phase2:{index}")`,
   sorted, among the phase-1 scenes with an action hash and an outcome not in `excluded_outcomes` (the
