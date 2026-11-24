@@ -57,6 +57,38 @@ def check_no_submission(api: str, hotkey: str) -> None:
         raise SystemExit(board.refusal(hotkey, s))
 
 
+def fee_of(api: str, hotkey: str, what: str = "check this hotkey's fee payment") -> dict | None:
+    """The fee view of the API for a hotkey ({fee, coldkey, paid, payments, scanned_to}); None when the API has no fee."""
+    import httpx
+
+    from .api import Api, ApiError
+    try:
+        return Api(api).fee(hotkey)
+    except ApiError as e:
+        if e.status == 404:
+            return None
+        raise SystemExit(f"vector-miner: cannot {what} at {api}: {e} (--no-api-check commits without the check)") from None
+    except httpx.HTTPError as e:
+        raise SystemExit(f"vector-miner: cannot reach {api} to {what}: {e} (--no-api-check commits without the "
+                         "check)") from None
+
+
+def fee_needed(j: dict, api: str, wallet: str = "") -> str:
+    f = j["fee"]
+    who = j.get("coldkey") or "the coldkey that owns this hotkey"
+    return (f"vector-miner: no unused fee payment of {f['tao']:g} TAO from {who} to the vault {f['vault']}. Every "
+            "submission needs its own payment, made before the commit; a commitment without one is unpaid and never "
+            f"evaluated. Pay it with vector-miner fee pay --api {api}{wallet}, wait until vector-miner fee status "
+            f"--api {api}{wallet} shows it, then commit")
+
+
+def check_fee(api: str, hotkey: str, wallet: str = "") -> None:
+    j = fee_of(api, hotkey)
+    if j is None or not j.get("fee") or j.get("paid"):
+        return
+    raise SystemExit(fee_needed(j, api, wallet))
+
+
 def pull_account(api: str | None) -> str | None:
     """The subnet's team account that must be able to pull a private image (`pull_account` of the expert view)."""
     if not api:
@@ -96,8 +128,10 @@ def cmd_commit(a) -> int:
             print(private_warning(ref, getattr(a, "api", None) or getattr(a, "dev_api", None)), file=sys.stderr)
     kp = _keypair(a)
     if not a.no_api_check:
-        check_no_submission(_api_or_exit(a, "commit first checks that this hotkey has no submission "
-                                            "(one per hotkey, ever; --no-api-check skips it)"), kp.ss58_address)
+        api = _api_or_exit(a, "commit first checks that this hotkey has no submission "
+                              "(one per hotkey, ever; --no-api-check skips it)")
+        check_no_submission(api, kp.ss58_address)
+        check_fee(api, kp.ss58_address, _wallet_flags(a))
     if a.dev_api:
         from .api import Api
         r = Api(a.dev_api, kp).dev_commit(ref)
@@ -153,6 +187,84 @@ def cmd_status(a) -> int:
         if out.get(k):
             print(f"vector-miner: {out[k]}", file=sys.stderr)
     return 0
+
+
+def _fee_line(j: dict) -> str:
+    f = j.get("fee")
+    if not f:
+        return "no submission fee is in effect"
+    if j.get("paid"):
+        p = (j.get("payments") or [{}])[0]
+        return (f"paid: payment {p.get('id')} ({p.get('tao')} TAO) from {j.get('coldkey')} backs your next commitment; "
+                f"{len(j.get('payments') or [])} unused")
+    seen = f" (payments seen up to block {j['scanned_to']})" if j.get("scanned_to") is not None else ""
+    return (f"not paid: send {f['tao']:g} TAO from {j.get('coldkey') or 'the coldkey that owns this hotkey'} to the "
+            f"vault {f['vault']} before you commit (vector-miner fee pay){seen}")
+
+
+def cmd_fee(a) -> int:
+    api = _api_or_exit(a, "the fee and the vault come from the API")
+    hotkey = getattr(a, "hotkey", None) or _keypair(a, "pass --hotkey <ss58>, or ").ss58_address
+    j = fee_of(api, hotkey, "read the fee")
+    if j is None:
+        print(f"vector-miner: {api} has no submission fee", file=sys.stderr)
+        return 0
+    if a.fee_cmd == "status":
+        print(json.dumps(j, indent=1))
+        print(f"vector-miner: {_fee_line(j)}", file=sys.stderr)
+        return 0
+    f = j.get("fee")
+    if not f:
+        print("vector-miner: no submission fee is in effect: nothing to pay", file=sys.stderr)
+        return 0
+    if j.get("paid") and not a.again:
+        print(f"vector-miner: {_fee_line(j)} (--again pays one more)", file=sys.stderr)
+        return 0
+    cold = _coldkey_address(a)
+    owner = j.get("coldkey")
+    if owner and cold and owner != cold:
+        raise SystemExit(f"vector-miner: the hotkey {hotkey} is owned by the coldkey {owner}, not by this wallet's "
+                         f"coldkey {cold}: only a payment from {owner} counts. Pay from the wallet of that coldkey")
+    if not owner:
+        print(f"vector-miner: warning: the hotkey {hotkey} is not registered yet; only a payment from the coldkey "
+              "that owns it counts", file=sys.stderr)
+    payer = owner or cold or "this wallet's coldkey"
+    where = f"the dev API {a.dev_api}" if a.dev_api else f"network {a.network}"
+    print(f"vector-miner: pay {f['tao']:g} TAO from {payer} to the vault {f['vault']} on {where}. The transfer is "
+          "final; one payment backs one submission.", file=sys.stderr)
+    if not a.yes:
+        try:
+            ok = input("Pay? [y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:
+            ok = False
+        if not ok:
+            print("vector-miner: not paid", file=sys.stderr)
+            return 1
+    if a.dev_api:
+        from .api import Api
+        r = Api(a.dev_api, _keypair(a)).dev_fee_pay(float(f["tao"]))
+        print(json.dumps(r))
+        ok = True
+    else:
+        import bittensor as bt
+
+        from .chain import pay_fee
+        r = pay_fee(a.network, bt.Wallet(a.wallet_name, a.wallet_hotkey, a.wallet_path), str(f["vault"]),
+                    float(f["tao"]))
+        print(json.dumps(r))
+        ok = bool(r.get("ok"))
+    if ok:
+        print(f"vector-miner: paid. Once vector-miner fee status --api {api}{_wallet_flags(a)} shows it, commit: "
+              f"vector-miner commit --image <image@sha256:...> --api {api}{_wallet_flags(a)}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _coldkey_address(a) -> str | None:
+    from bittensor_wallet import Wallet
+    try:
+        return Wallet(name=a.wallet_name, hotkey=a.wallet_hotkey, path=a.wallet_path).coldkeypub.ss58_address
+    except Exception:
+        return None
 
 
 def _bundle():
@@ -417,6 +529,19 @@ def main(argv=None) -> int:
                                                         "its rank after the round decision, the verdict")
     s.add_argument("--api", default=api_default, required=not api_default)
     s.add_argument("--hotkey", help="an ss58 address instead of the wallet's hotkey")
+    fe = sub.add_parser("fee", help="the submission fee: status (the fee, the vault, your unused payments) or pay "
+                                    "(from your coldkey to the vault, before you commit)")
+    fsub = fe.add_subparsers(dest="fee_cmd", required=True)
+    fs = fsub.add_parser("status", parents=[common], help="the fee, the vault and the unused payments that can back "
+                                                         "this hotkey's next commitment")
+    fs.add_argument("--api", default=api_default)
+    fs.add_argument("--hotkey", help="an ss58 address instead of the wallet's hotkey")
+    fp = fsub.add_parser("pay", parents=[common], help="pay the fee from the wallet's coldkey to the vault (asks first)")
+    fp.add_argument("--api", default=api_default)
+    fp.add_argument("--network", default="finney")
+    fp.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    fp.add_argument("--again", action="store_true", help="pay even when an unused payment already exists")
+    fp.add_argument("--dev-api", help="a local dev API (no chain): pay there instead")
     sv = sub.add_parser("serve", parents=[common], help="phase 1: connect to the subnet and run your committed image "
                                                         "locally on the scenes it sends")
     sv.add_argument("--image", required=True, help="the image you committed (ghcr.io/<you>/<repo>@sha256:<digest>)")
@@ -479,7 +604,7 @@ def main(argv=None) -> int:
                    help="no salt commitment time (salt_committed_at null) is a warning, not a problem")
     a = ap.parse_args(argv)
     return {"commit": cmd_commit, "status": cmd_status, "serve": cmd_serve, "eval": cmd_eval,
-            "verify": cmd_verify}[a.cmd](a)
+            "verify": cmd_verify, "fee": cmd_fee}[a.cmd](a)
 
 
 if __name__ == "__main__":

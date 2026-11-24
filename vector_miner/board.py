@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 FINAL = ("below_king", "ranked", "not_ranked", "disqualified", "duplicate_hotkey", "invalid", "copy", "abandoned",
-         "crowned", "not_crowned")
-NO_SLOT = ("duplicate_hotkey", "invalid", "copy", "abandoned")
+         "unpaid", "crowned", "not_crowned")
+NO_SLOT = ("duplicate_hotkey", "invalid", "copy", "abandoned", "unpaid")
 SHARES = (0.7, 0.2, 0.1)
 
 
@@ -97,6 +97,9 @@ def verdict(s: dict, ex: dict) -> str:
     if st == "copy":
         return (f"a copy of an earlier submission: {why or 'the same image digest'}; it did not use this hotkey's "
                 "submission, the hotkey may commit again")
+    if st == "unpaid":
+        return (f"unpaid: {why or 'no fee payment backed it'}; it is never evaluated and did not use this hotkey's "
+                "submission: pay the fee (vector-miner fee pay), then commit again")
     if st == "review":
         at = s.get("retry_at")
         line = "review: being re-run because of a problem on our side, not your expert's"
@@ -129,6 +132,7 @@ def status(api, hotkey: str) -> dict:
     out = {"hotkey": hotkey, "king": bool(king) and king.get("hotkey") == hotkey, "rank": mine[0] if mine else None,
            "king_hotkey": king.get("hotkey"), "king_image": king.get("image"), "king_score": _num(king.get("score")),
            "bar": _num(ex.get("bar")), "margin": _num(ex.get("margin")),
+           "fee": ex.get("fee") if isinstance(ex.get("fee"), dict) else None,
            "ranks": [{k: r.get(k) for k in ("rank", "share", "hotkey", "score", "round")} for r in ranks],
            "submissions": subs}
     if not ranks:
@@ -151,7 +155,7 @@ def existing(rows: list[dict]) -> dict | None:
 def refusal(hotkey: str, s: dict) -> str:
     return (f"vector-miner: hotkey {hotkey} already has submission {s.get('id')} ({s.get('image')}, "
             f"status {s.get('status')}, committed {s.get('committed_at')}). The subnet takes one submission per "
-            f"hotkey, ever, and a submission in {s.get('status')} uses it (only invalid, copy, duplicate_hotkey "
-            "and abandoned commits leave it free): another commit from this hotkey would be refused as duplicate_hotkey and never "
+            f"hotkey, ever, and a submission in {s.get('status')} uses it (only invalid, copy, duplicate_hotkey, "
+            "abandoned and unpaid commits leave it free): another commit from this hotkey would be refused as duplicate_hotkey and never "
             "evaluated. To submit another image, register a new hotkey (btcli subnet register) and commit from it; "
             "vector-miner status shows how this one is doing")

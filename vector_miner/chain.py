@@ -84,6 +84,16 @@ def commit(network: str, netuid: int, hotkey_keypair, ref: str) -> dict:
     return {"ok": bool(res) if ok is None else bool(ok), "result": str(res)[:500]}
 
 
+def pay_fee(network: str, wallet, vault: str, tao: float) -> dict:
+    """Transfer `tao` TAO from the wallet's coldkey to the vault (keep-alive: the coldkey stays above the deposit)."""
+    import bittensor as bt
+    sub = bt.Subtensor(network=network)
+    res = sub.execute(bt.Transfer(dest_ss58=vault, amount_tao=tao), wallet)
+    ok = getattr(res, "success", None)
+    return {"ok": bool(res) if ok is None else bool(ok), "extrinsic": getattr(res, "extrinsic_id", None),
+            "result": str(res)[:500]}
+
+
 def read_commitment(network: str, netuid: int, hotkey: str):
     import bittensor as bt
     c = bt.Subtensor(network=network).read("commitment", netuid=int(netuid), hotkey_ss58=hotkey)

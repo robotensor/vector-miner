@@ -93,3 +93,12 @@ class Api:
 
     def dev_commit(self, image: str) -> dict:
         return self.post_signed("/v1/dev/commit", {"image": image})
+
+    def fee(self, hotkey: str) -> dict:
+        j = self.get(f"/v1/skills/{SKILL}/expert/fee?hotkey={quote(hotkey, safe='')}")
+        if not isinstance(j, dict) or "fee" not in j:
+            raise ApiError(200, "the fee response has no fee")
+        return j
+
+    def dev_fee_pay(self, tao: float | None = None) -> dict:
+        return self.post_signed("/v1/dev/fee/pay", {} if tao is None else {"tao": tao})

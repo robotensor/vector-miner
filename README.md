@@ -12,7 +12,7 @@ flowchart LR
   DT --> C["docker build, push to ghcr.io (public, or private and shared with the team account)"]
   C --> E["image@sha256 digest"]
   R["btcli subnet register: hotkey gets a uid"] --> F
-  E --> F["vector-miner commit (once per hotkey, ever)"]
+  E --> F["vector-miner fee pay, then vector-miner commit (once per hotkey, ever)"]
   F --> SV["vector-miner serve: your machine plays your fresh scenes, 1,000 by default (phase 1)"]
   SV --> SC["phase-1 score"]
   SC -->|"not above the bar (the king's score + margin)"| BK["below_king (final)"]
@@ -131,8 +131,12 @@ docker inspect --format '{{index .RepoDigests 0}}' ghcr.io/<you>/bin-expert:dev 
 .venv/bin/vector-miner commit --network test --netuid <test-netuid> --no-api-check \
   --image ghcr.io/<you>/bin-expert@sha256:<digest> --wallet.name <coldkey> --wallet.hotkey <hotkey>
 
-# 8. commit, once: this hotkey can never commit another image
+# 8. pay the submission fee from the coldkey that owns the hotkey, then wait until status lists it
 export VECTOR_MINER_API=https://vector.robotensor.ai
+.venv/bin/vector-miner fee pay --wallet.name <coldkey> --wallet.hotkey <hotkey>
+.venv/bin/vector-miner fee status --wallet.name <coldkey> --wallet.hotkey <hotkey>
+
+# 8b. commit, once: this hotkey can never commit another image
 .venv/bin/vector-miner commit --image ghcr.io/<you>/bin-expert@sha256:<digest> --netuid <netuid> \
   --wallet.name <coldkey> --wallet.hotkey <hotkey>
 
@@ -146,6 +150,20 @@ docker pull ghcr.io/<you>/bin-expert@sha256:<digest>
 ```
 
 `<netuid>` and `<test-netuid>` are published with the subnet.
+
+### The submission fee
+
+- Every submission must be backed by its own payment of the submission fee (now 0.1 TAO) to Vector's vault (now
+  `5DSaD8eKWjRqSxKspk9CQRbhzHVidxKEdoXBzBTf5WMd8668`). The amount and the vault are also shown on the Bin picking page and in `fee` of
+  `GET /v1/skills/bin-picking/expert`, and can change.
+- The payment is a transfer of at least the fee from the coldkey that owns the committing hotkey to the vault, made
+  at or before the commit's block. Pay before you commit.
+- One payment backs one submission. A commitment without one is `unpaid` and is never evaluated; it does not use the
+  hotkey's submission: pay, then commit again.
+- `vector-miner fee pay` reads the fee and the vault from the API, asks, then sends the transfer signed by the
+  wallet's coldkey (`--yes` skips the question, `--again` pays when an unused payment exists, `--network` finney).
+  `vector-miner fee status` shows the fee, the vault, the owner coldkey and its unused payments.
+- `vector-miner commit` refuses without an unused payment and prints what to pay (`--no-api-check` skips it).
 
 ### Wallet and registration
 
@@ -320,6 +338,8 @@ vector-miner commit --image REF --netuid <netuid> [--network finney] [--api URL 
 vector-miner serve --image REF [--api URL] [--concurrency 8] [--warm N] [--command "..."] [--cpus 4] [--memory 8g]
                    [--docker docker] [--pull] [--stderr DIR] [--wallet.name --wallet.hotkey --wallet.path]
 vector-miner status [--api URL] [--hotkey <ss58>] [--wallet.name --wallet.hotkey]
+vector-miner fee status [--api URL] [--hotkey <ss58>] [--wallet.name --wallet.hotkey --wallet.path]
+vector-miner fee pay [--api URL] [--network finney] [--yes] [--again] [--wallet.name --wallet.hotkey --wallet.path]
 vector-miner verify --submission ID (--api URL | --doc FILE) [--save FILE] [--hash-scenes M]
                     [--image REF|submission [--command "..."] [--scenes 20] [--sample-seed 0] [--workers 1]
                     [--wall S] [--cpus 4] [--memory 8g] [--docker docker] [--pull]] [--salt-sha256 HEX]

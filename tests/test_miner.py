@@ -129,8 +129,8 @@ def test_commit_refuses_a_hotkey_that_already_has_a_submission(monkeypatch, stat
         msg = str(e.value.code)
         assert f"already has submission sub-7 ({REF}, status {status}" in msg
         assert "one submission per hotkey, ever" in msg and "duplicate_hotkey" in msg and "new hotkey" in msg
-        assert (f"a submission in {status} uses it (only invalid, copy, duplicate_hotkey and abandoned commits leave "
-                "it free)") in msg
+        assert (f"a submission in {status} uses it (only invalid, copy, duplicate_hotkey, abandoned and unpaid commits "
+                "leave it free)") in msg
 
 
 def test_commit_goes_ahead_when_no_earlier_commit_used_the_slot(monkeypatch):
@@ -139,11 +139,11 @@ def test_commit_goes_ahead_when_no_earlier_commit_used_the_slot(monkeypatch):
     monkeypatch.setattr(cli, "_keypair", lambda a: alice)
     monkeypatch.setattr(api_mod.Api, "dev_commit", lambda self, image: sent.append(image) or {"block": 9})
     rows = [{"hotkey": alice.ss58_address, "id": f"sub-{k}", "image": REF, "status": st, "commit_block": k}
-            for k, st in enumerate(("invalid", "copy", "duplicate_hotkey", "abandoned"))]
+            for k, st in enumerate(("invalid", "copy", "duplicate_hotkey", "abandoned", "unpaid"))]
     _api(monkeypatch, _subs(rows))
     assert cli.main(["commit", "--image", REF, "--no-check", "--dev-api", "http://api"]) == 0 and sent == [REF]
-    rows += [{"hotkey": alice.ss58_address, "id": "sub-5", "image": REF, "status": "below_king", "commit_block": 5}]
-    with pytest.raises(SystemExit, match="already has submission sub-5 .*status below_king"):
+    rows += [{"hotkey": alice.ss58_address, "id": "sub-6", "image": REF, "status": "below_king", "commit_block": 6}]
+    with pytest.raises(SystemExit, match="already has submission sub-6 .*status below_king"):
         cli.main(["commit", "--image", REF, "--no-check", "--dev-api", "http://api"])
     assert sent == [REF]
 
@@ -592,3 +592,89 @@ def test_commit_warns_for_a_private_image_and_names_the_team_account(monkeypatch
     with pytest.raises(SystemExit, match="not pullable: no such image"):
         cli.main(["commit", "--image", REF, "--dev-api", "http://api"])
     assert len(sent) == 2
+
+
+VAULT = Keypair.create_from_uri("//VectorVault").ss58_address
+COLD = Keypair.create_from_uri("//ColdA").ss58_address
+
+
+def _fee_api(rows, fee, seen=None):
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/skills/bin-picking/expert/fee":
+            return httpx.Response(200, json={"hotkey": req.url.params["hotkey"], **fee})
+        if req.url.path == "/v1/dev/fee/pay":
+            (seen if seen is not None else []).append(json.loads(req.content))
+            return httpx.Response(200, json={"block": 1002, "extrinsic": 1, "from": COLD, "to": VAULT,
+                                             "amount_rao": 10 ** 8})
+        return _subs(rows)(req)
+    return handler
+
+
+UNPAID = {"fee": {"tao": 0.1, "vault": VAULT}, "coldkey": COLD, "paid": False, "payments": [], "scanned_to": 1001}
+PAID = {**UNPAID, "paid": True, "payments": [{"id": "1000-1", "block": 1000, "extrinsic": 1, "tao": 0.1}]}
+
+
+def test_commit_refuses_without_a_fee_payment(monkeypatch):
+    alice = Keypair.create_from_uri("//Alice")
+    monkeypatch.setattr(cli, "_keypair", lambda a: alice)
+    monkeypatch.setattr(api_mod.Api, "dev_commit", lambda self, image: pytest.fail("committed"))
+    monkeypatch.setattr(chain, "commit", lambda *a: pytest.fail("committed on chain"))
+    _api(monkeypatch, _fee_api([], UNPAID))
+    for argv in (["--dev-api", "http://api"], ["--netuid", "1", "--api", "http://api"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["commit", "--image", REF, "--no-check", *argv])
+        msg = str(e.value.code)
+        assert f"no unused fee payment of 0.1 TAO from {COLD} to the vault {VAULT}" in msg
+        assert "vector-miner fee pay --api http://api" in msg and "never evaluated" in msg
+
+
+def test_commit_goes_ahead_with_a_payment_or_without_a_fee(monkeypatch):
+    alice = Keypair.create_from_uri("//Alice")
+    sent = []
+    monkeypatch.setattr(cli, "_keypair", lambda a: alice)
+    monkeypatch.setattr(api_mod.Api, "dev_commit", lambda self, image: sent.append(image) or {"block": 9})
+    for fee in (PAID, {"fee": None, "paid": True, "payments": []}):
+        _api(monkeypatch, _fee_api([], fee))
+        assert cli.main(["commit", "--image", REF, "--no-check", "--dev-api", "http://api"]) == 0
+    assert sent == [REF, REF]
+
+
+def test_fee_status_and_pay(monkeypatch, capsys):
+    alice = Keypair.create_from_uri("//Alice")
+    monkeypatch.setattr(cli, "_keypair", lambda a, alt="": alice)
+    monkeypatch.setattr(cli, "_coldkey_address", lambda a: COLD)
+    seen = []
+    _api(monkeypatch, _fee_api([], UNPAID, seen))
+    assert cli.main(["fee", "status", "--api", "http://api"]) == 0
+    out = capsys.readouterr()
+    assert json.loads(out.out)["fee"] == {"tao": 0.1, "vault": VAULT}
+    assert f"not paid: send 0.1 TAO from {COLD} to the vault {VAULT} before you commit" in out.err
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    assert cli.main(["fee", "pay", "--dev-api", "http://api"]) == 1 and seen == []
+    assert cli.main(["fee", "pay", "--dev-api", "http://api", "--yes"]) == 0 and seen == [{"tao": 0.1}]
+    assert f"pay 0.1 TAO from {COLD} to the vault {VAULT}" in capsys.readouterr().err
+    _api(monkeypatch, _fee_api([], PAID, seen))
+    assert cli.main(["fee", "pay", "--dev-api", "http://api", "--yes"]) == 0 and len(seen) == 1
+    assert "--again pays one more" in capsys.readouterr().err
+    monkeypatch.setattr(cli, "_coldkey_address", lambda a: VAULT)
+    _api(monkeypatch, _fee_api([], UNPAID, seen))
+    with pytest.raises(SystemExit, match=f"is owned by the coldkey {COLD}, not by this wallet's coldkey"):
+        cli.main(["fee", "pay", "--dev-api", "http://api", "--yes"])
+
+
+def test_fee_pay_on_chain_sends_a_transfer(monkeypatch):
+    alice = Keypair.create_from_uri("//Alice")
+    monkeypatch.setattr(cli, "_keypair", lambda a, alt="": alice)
+    monkeypatch.setattr(cli, "_coldkey_address", lambda a: COLD)
+    sent = []
+    monkeypatch.setattr(chain, "pay_fee", lambda net, w, vault, tao: sent.append((net, vault, tao)) or {"ok": True})
+    _api(monkeypatch, _fee_api([], UNPAID))
+    assert cli.main(["fee", "pay", "--api", "http://api", "--network", "test", "--yes"]) == 0
+    assert sent == [("test", VAULT, 0.1)]
+
+
+def test_the_unpaid_verdict():
+    from vector_miner import board
+    v = board.verdict({"status": "unpaid", "reason": "No fee payment of 0.1 TAO"}, {})
+    assert v.startswith("unpaid: No fee payment") and "vector-miner fee pay" in v and "commit again" in v
+    assert board.existing([{"status": "unpaid", "commit_block": 1}]) is None
