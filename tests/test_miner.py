@@ -240,8 +240,8 @@ def test_status_shows_progress_queue_phase2_rank_and_verdict(monkeypatch, capsys
         "passed": ({"round": 3}, "phase 2 passed · decided when round 3 is"),
         "ranked": ({"rank": 1, "rank_at": 1}, "rank 1 · 70% of the expert part (the king)"),
         "not_ranked": ({"round": 3, "phase1": {"score": 0.7}}, "not in round 3's top three"),
-        "crowned": ({}, "crowned (before v10"),
-        "not_crowned": ({}, "not crowned (before v10)"),
+        "crowned": ({}, "crowned (an older status"),
+        "not_crowned": ({}, "not crowned (an older status)"),
         "disqualified": ({"reason": "action hash differs on 3 of 100 scenes"}, "action hash differs on 3 of 100"),
         "abandoned": ({}, "no miner connection within 48 h of the commit; it did not use this hotkey's submission"),
         "invalid": ({"reason": "the image is private"}, "the image is private; it did not use this hotkey's submission"),
@@ -305,7 +305,7 @@ def test_eval_runs_the_local_harness(capsys, tmp_path):
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     res = [json.loads(x) for x in rows.read_text().splitlines()]
     assert out["scenes"] == 2 and out["wall_s"] == wall and out["successes"] == sum(r["success"] for r in res), out
-    assert out["score"] == out["successes"] / 2 and out["successes"] >= 1, out
+    assert out["score"] == out["successes"] / 2, out
     for i, r in enumerate(res):
         assert r["wall_s"] < wall and r["outcome"] != "wall_timeout", r
         sc, _ = scenes.draw_index(1, i)

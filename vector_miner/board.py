@@ -82,11 +82,11 @@ def verdict(s: dict, ex: dict) -> str:
         return (f"not ranked at round {rnd if rnd is not None else '?'}'s decision (not above the king, or not in the "
                 "round's top three); final")
     if st == "crowned":
-        return "crowned (before v10: ranks replaced crowns); final"
+        return "crowned (an older status: ranks replaced crowns); final"
     if st == "not_crowned":
-        return "not crowned (before v10); final"
+        return "not crowned (an older status); final"
     if st == "king_run":
-        return "king run (before v10; no longer used)"
+        return "king run (an older status; no longer used)"
     if st == "disqualified":
         return f"disqualified: {why or 'no reason given'}; final"
     if st == "duplicate_hotkey":

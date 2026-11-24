@@ -303,8 +303,8 @@ def is_legacy(doc: dict) -> bool:
 
 
 def eligible(doc: dict) -> bool:
-    """The phase-1 score is above the bar (v10: decision.bar, the king's score + margin; null: no king, every score
-    counts). A document from before v10 has decision.king_best and the margin instead."""
+    """The phase-1 score is above the bar (decision.bar, the king's score + margin; null: no king, every score
+    counts). An older document has decision.king_best and the margin instead."""
     dec = doc.get("decision") or {}
     score = (doc.get("phase1") or {}).get("score") or 0
     if is_legacy(doc):
@@ -391,8 +391,8 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
     what = (f"the king's best {bar} + margin {margin}" if legacy else f"the bar {bar}")
     p2 = phase2_check(doc)
     if legacy:
-        warnings.append("a document from before v10: its king run and decisive re-check (if any) are not checked; "
-                        "v10 has none (phase 1, phase 2 and the bar are checked)")
+        warnings.append("an older document: its king run and decisive re-check (if any) are not checked "
+                        "(phase 1, phase 2 and the bar are checked)")
     if dec.get("phase2_ran") is not None and bool(dec["phase2_ran"]) != (p2 is not None):
         bad.append("decision.phase2_ran disagrees with the phase2 section")
     if st == "below_king":
@@ -445,7 +445,7 @@ def pick(doc: dict, ref: str | None) -> tuple[str, dict]:
     if ref in keys or (sub.get("digest") and ref.endswith("@" + sub["digest"])):
         return "submission", sub
     raise VerifyError(f"{ref} is not submission {sub.get('id')}'s image ({sub.get('image') or 'no image published'}); "
-                      "only the submission's own image can be re-run (v10 has no king run)")
+                      "only the submission's own image can be re-run (there is no king run)")
 
 
 def rerun(doc: dict, role: str, expert: dict, scenes: dict, e, *, wall_s: float | None = None, workers: int = 1,

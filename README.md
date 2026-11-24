@@ -319,7 +319,6 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 | `passed` | phase 2 passed; decided when its round is (every submission of the round final or `passed`) |
 | `ranked` | in the ranks after its round's decision: "rank k · 70%" (20 %, 10 %) while it holds one, "ranked out in round m" after; final |
 | `not_ranked` | phase 2 passed but not in the ranks: not above the bar, or not in its round's top three; final |
-| `crowned` / `not_crowned` / `king_run` | before v10 only (older submissions keep them) |
 | `disqualified` | phase 2 found another action hash or a scene over the wall, the image was gone when we copied it, or a stage failed on our side again after 2 reviews (`reason`); final |
 | `duplicate_hotkey` | a second commit from a hotkey that already had one; never evaluated |
 | `invalid` / `copy` | a bad commit, the digest of an earlier submission; neither uses the hotkey's submission, so it may commit again |
@@ -465,16 +464,13 @@ flowchart LR
   score above the bar needs three others to have entered (`new` full). The other submissions' scores are not in the
   document, so the order within `new` is not recomputed.
   Images must be `ghcr.io/<repo>@sha256:<digest>` with their own `digest`.
-- A document frozen before v10 (`crowned` / `not_crowned`, or one with `king`, `decisive` or `decision.king_best`
-  and no `decision.bar`) is still read: phase 1, phase 2 and the old gate (`decision.king_best` + `margin`) are checked, and a warning says
-  its king run and decisive re-check are not (v10 has none).
 - `--image` takes `submission`, or the submission image's reference, digest or hotkey; it runs the image (or
   `--command` instead) on `--scenes` scenes with a published verdict that is not a cut-off, sampled with `--sample-seed`, and reports
   `hash_equal`, `hash_agreement`, `outcome_agreement` and every scene whose action hash differs. A deterministic
   image gives the published hashes on any machine. Re-run differences do not change the exit code.
 - `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched`, `over_wall`, `infra`,
   `passed`; `decision` the round decision: `round`, `bar`, `rank_at`, `new` (how many entered), `entered`,
-  `above_bar` (null for a document from before v10).
+  `above_bar` (null for an older document without `decision.bar`).
 - The document is read as strict JSON (no NaN), at most 64 MB, and every field is type-checked first.
 - Regeneration needs the same vector-env version and asset bundle as the submission (`env` in the document, or a
   scene's own `env` when it was made with another one); with another one, the output warns, and a scene whose

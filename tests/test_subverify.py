@@ -113,8 +113,8 @@ def make_doc(e, status="ranked", count=12, bar=0.4, p1_infra=(), p2_infra=0):
             "decision": {"round": 3, "bar": bar, "rank_at": 2 if status == "ranked" else None, "new": new}}
 
 
-def make_v9_doc(e, status="crowned"):
-    """A frozen document from before v10: a king run, a decisive re-check and the old decision."""
+def make_old_doc(e, status="crowned"):
+    """A frozen document in the older format: a king run, a decisive re-check and the old decision."""
     doc = make_doc(e, {"crowned": "ranked", "not_crowned": "not_ranked"}.get(status, status))
     doc["submission"]["status"] = status
     del doc["submission"]["round"]
@@ -162,13 +162,13 @@ def test_the_round_decision_is_checked(capsys, env, tmp_path):
     assert problems(capsys, tmp_path, first)[:2] == (0, [])
 
 
-def test_documents_from_before_v10_still_check(capsys, env, tmp_path):
+def test_older_documents_still_check(capsys, env, tmp_path):
     for st in ("crowned", "not_crowned", "below_king"):
-        doc = make_v9_doc(fake_env(broken=BROKEN), st)
+        doc = make_old_doc(fake_env(broken=BROKEN), st)
         code, got, out = problems(capsys, tmp_path, doc)
         assert code == 0 and got == [] and out["decision"] is None, (st, out["document"])
-        assert any("from before v10" in w for w in out["document"]["warnings"]), out["document"]
-    doc = make_v9_doc(fake_env(broken=BROKEN), "crowned")
+        assert any("an older document" in w for w in out["document"]["warnings"]), out["document"]
+    doc = make_old_doc(fake_env(broken=BROKEN), "crowned")
     code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["decision", "king_best"], 0.99)))
     assert code == 1 and any("is not above the king's best 0.99 + margin 0.02" in p for p in got), got
     code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["phase2", "action_hash", 0], "1" * 16)))
@@ -176,7 +176,7 @@ def test_documents_from_before_v10_still_check(capsys, env, tmp_path):
     late = _t(doc, lambda d: (d["submission"].update(status="disqualified", reason="1 decisive scene differed"),
                               d["decision"].update(crowned=False)))
     assert problems(capsys, tmp_path, late)[:2] == (0, [])
-    low = make_v9_doc(fake_env(broken=BROKEN), "below_king")
+    low = make_old_doc(fake_env(broken=BROKEN), "below_king")
     code, got, _ = problems(capsys, tmp_path, _t(low, _set(["decision", "king_best"], 0.1)))
     assert code == 1 and any("below_king, but the phase-1 score" in p for p in got), got
 
