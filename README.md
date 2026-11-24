@@ -13,14 +13,14 @@ flowchart LR
   C --> E["image@sha256 digest"]
   R["btcli subnet register: hotkey gets a uid"] --> F
   E --> F["vector-miner commit (once per hotkey, ever)"]
-  F --> SV["vector-miner serve: your machine plays 1,000 fresh scenes (phase 1)"]
+  F --> SV["vector-miner serve: your machine plays your fresh scenes, 1,000 by default (phase 1)"]
   SV --> SC["phase-1 score"]
   SC -->|"not above the bar (the king's score + margin)"| BK["below_king (final)"]
   SC -->|"above"| RE["waits for the end of its round (the round its phase 1 ended in)"]
   RE --> Q["the round's evaluation: in commit order, one at a time"]
   Q --> CP["the subnet copies your image into its registry"]
   CP -->|"the image is gone (deleted, or private and not shared)"| DQ["disqualified"]
-  CP --> P2["phase 2: the copy runs in docker on 100 of the scenes"]
+  CP --> P2["phase 2: the copy runs in docker on 100 of the scenes (by default)"]
   P2 -->|"an action hash differs, or a scene is over the wall"| DQ
   P2 -->|"all equal"| PS["passed: waits for the round decision"]
   PS --> RD{"round decision: the round's best three above the bar"}
@@ -32,8 +32,11 @@ flowchart LR
   BK --> V
 ```
 
-On commit the subnet makes a secret salt for your submission and publishes its `salt_sha256`; the 1,000 scenes
-are drawn from that salt. Phase 1 is played on your machine: `vector-miner serve` dials out to the subnet, our
+On commit the subnet makes a secret salt for your submission and publishes its `salt_sha256`; your scenes
+are drawn from that salt. The evaluation sizes, 1,000 phase-1 scenes and 100 phase-2 scenes, are defaults the subnet
+can change at any time: each submission is evaluated on the sizes in force when it was committed, whatever changes
+later, and the board shows them per submission (`eval: {scenes, phase2_scenes}` on each row of
+`GET /v1/skills/bin-picking/expert/submissions`; `phase1.total` is its scene count). Phase 1 is played on your machine: `vector-miner serve` dials out to the subnet, our
 simulator plays every scene against your image step by step, and each scene's rows are hashed (the action hash).
 The subnet runs in rounds (one schedule for miners and contributors; the length is a subnet setting, shown with its
 dates in `GET /v1/skills/bin-picking/expert` as `round`). Your submission belongs to the round in which its phase 1
@@ -45,7 +48,8 @@ commit block), one submission at a time, each checked against the bar again when
 your phase-1 scenes and results for this. When your submission's turn comes, the subnet first copies your committed
 image into its own registry (until then keep the image public, or private and shared with the subnet's team account
 with Read access: an image the subnet cannot pull then is `disqualified`, "image no longer available"); everything
-after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of those scenes: every
+after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of those scenes (its
+`phase2_scenes`): every
 action hash must equal phase 1's, or the submission is disqualified. A submission that passes phase 2 is `passed`.
 There is no king run and no re-check against the king.
 
@@ -162,7 +166,7 @@ docker pull ghcr.io/<you>/bin-expert@sha256:<digest>
 ## Determinism
 
 The same scene and the same messages must give the same rows, every run, on any machine. Phase 2 checks this on
-100 of your scenes by comparing action hashes (vector-env's README defines the hash: FNV-1a 64 over every row value
+a sample of your scenes (100 by default) by comparing action hashes (vector-env's README defines the hash: FNV-1a 64 over every row value
 you sent); one difference disqualifies the submission.
 
 - Seed every random draw from the scene (`scene.scene_id`, `checkpoint`), never from the time, the process id or
@@ -292,7 +296,7 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 | `phase1` | `serve` is playing your scenes: `phase1.done` of `phase1.total`. After the first hour on the socket it must keep up 200 scenes an hour on average (8 at once do ≥ 640), or the rest count as failures and the slot goes to the next miner |
 | `scored` | phase 1 is done and above the bar: waits for its round to end (`evaluates_at`), then for its turn in the evaluation (`queue_position`) |
 | `below_king` | phase 1 is not above the bar (the king's score + margin); final. A queued submission is checked against the bar again when its turn comes (the bar only rises) |
-| `phase2` | `stage` `copy`: we copy your image into our registry; then we run the copy in docker on 100 of your scenes and compare action hashes |
+| `phase2` | `stage` `copy`: we copy your image into our registry; then we run the copy in docker on 100 (by default) of your scenes and compare action hashes |
 | `passed` | phase 2 passed; decided when its round is (every submission of the round final or `passed`) |
 | `ranked` | in the ranks after its round's decision: "rank k · 70%" (20 %, 10 %) while it holds one, "ranked out in round m" after; final |
 | `not_ranked` | phase 2 passed but not in the ranks: not above the bar, or not in its round's top three; final |
@@ -399,7 +403,7 @@ flowchart LR
 ```
 
 ```bash
-# check the document and regenerate all 1000 scenes (about 2 s each; --hash-scenes 100 checks a sample)
+# check the document and regenerate all its scenes (1000 by default, about 2 s each; --hash-scenes 100 checks a sample)
 .venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai
 
 # also re-run the submission's image on 20 sampled scenes in docker and compare action hashes
@@ -425,7 +429,7 @@ flowchart LR
   failures), mean times match the successful scenes; `below_king` needs a phase-1 score not above
   `decision.bar` (a null bar: no king, every score counts) and no phase 2; any other final status needs one above it
   and a phase 2 on the
-  sample rule's scenes: the `phase2_scenes` (100) indexes with the smallest `sha256(f"{salt}:phase2:{index}")`,
+  sample rule's scenes: the `phase2_scenes` (the submission's own, 100 by default) indexes with the smallest `sha256(f"{salt}:phase2:{index}")`,
   sorted, among the phase-1 scenes with an action hash and an outcome not in `excluded_outcomes` (the
   infrastructure outcomes, `not_run` and the cut-offs `step_timeout`, `disconnected`, `wall_timeout`; a document
   that leaves out any other outcome is a problem; one without the field is read with the older rule, only
