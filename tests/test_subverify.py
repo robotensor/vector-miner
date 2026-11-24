@@ -60,9 +60,10 @@ def _sample(ok, k=6):
     return sorted(sorted(ok, key=lambda i: hashlib.sha256(f"{SALT}:phase2:{i}".encode()).hexdigest())[:k])
 
 
-def make_doc(e, status="crowned", count=12, king_best=0.4, p1_infra=(), p2_infra=0, king_infra=(), genesis=False):
-    late = status == "decisive_failed"
-    status = "crowned" if late else status
+OTHERS = ["sub-50", "sub-51", "sub-52"]
+
+
+def make_doc(e, status="ranked", count=12, bar=0.4, p1_infra=(), p2_infra=0):
     rows, made, skipped = [], [], []
     for i in range(count):
         sc = None
@@ -80,7 +81,7 @@ def make_doc(e, status="crowned", count=12, king_best=0.4, p1_infra=(), p2_infra
     count = len(rows)
     p1 = _part(e, SUB, made, p1_infra)
     if status == "below_king":
-        king_best = p1["score"]
+        bar = p1["score"]
     res = p1["results"]
     pos = {x["index"]: k for k, x in enumerate(rows)}
     sample = _sample([x["index"] for k, x in enumerate(rows) if k not in p1_infra])
@@ -96,91 +97,88 @@ def make_doc(e, status="crowned", count=12, king_best=0.4, p1_infra=(), p2_infra
         if status == "disqualified" and p2_infra + 1 < len(sample):
             p2["action_hash"][p2_infra + 1] = "0" * 16
             p2["mismatched"] = [sample[p2_infra + 1]]
-    king, left = None, set(p1_infra)
-    if status in ("crowned", "not_crowned"):
-        part = _part(e, KING, made, king_infra)
-        if status == "not_crowned":
-            part = {k: p1[k] for k in ("score", "successes", "mean_time_s", "results")}
-        else:
-            left |= set(king_infra)
-        king = {"id": None if genesis else "sub-7", "hotkey": "5Kate", "team": genesis,
-                "image": None if genesis else KING, "source_image": None if genesis else KING,
-                "digest": None if genesis else "sha256:" + "c" * 64, "status": "king", "reason": None,
-                **{k: part[k] for k in ("score", "successes", "mean_time_s", "results")}}
-    pairs = [k for k in range(count) if k not in left]
-    n = len(pairs)
-    cs = sum(res["success"][k] for k in pairs) / n
-    ks = sum(king["results"]["success"][k] for k in pairs) / n if king else None
-    if king:
-        king["score"] = ks
-    beats = king is not None and cs > ks + 0.02
-    decisive = None
-    if beats:
-        seen = set(p2["scenes"]) if p2 else set()
-        d = sorted(rows[k]["index"] for k in pairs if res["success"][k] and not king["results"]["success"][k]
-                   and rows[k]["index"] not in seen)
-        decisive = {"status": "passed", "reason": None, "scenes": d,
-                    "outcome": [res["outcome"][pos[i]] for i in d],
-                    "action_hash": [res["action_hash"][pos[i]] for i in d], "wall_s": [12.5 for _ in d],
-                    "mismatched": [], "wall_timeouts": [], "rule": "..."}
-        if late:
-            decisive["action_hash"][0] = "0" * 16
-            decisive.update(status="failed", mismatched=[d[0]],
-                            reason="1 of 2 decisive scenes (won against the king) gave other actions")
-            status = "disqualified"
-    doc_reason = (decisive or {}).get("reason") if late else (p2["reason"] if status == "disqualified" else None)
+    new = {"ranked": ["sub-50", SID], "not_ranked": OTHERS}.get(status, [])
     return {"format": subverify.FORMAT, "skill": "bin-picking",
             "submission": {"id": SID, "hotkey": "5Alice", "uid": 4, "image": SUB, "digest": "sha256:" + "a" * 64,
-                           "commit_block": 100, "status": status,
-                           "reason": doc_reason, "mirror_url": None,
+                           "commit_block": 100, "round": 3, "status": status,
+                           "reason": p2["reason"] if status == "disqualified" else None, "mirror_url": None,
                            "committed_at": "2026-11-23T01:00:00+00:00", "scored_at": "2026-11-23T05:00:00+00:00",
                            "finished_at": "2026-11-23T09:00:00+00:00"},
             "salt": SALT, "salt_sha256": hashlib.sha256(SALT.encode()).hexdigest(),
             "salt_committed_at": "2026-11-23T01:00:01+00:00", "phase1_started_at": "2026-11-23T01:05:00+00:00",
             "seed_rule": "...", "seed_tries": 6, "skipped": skipped, "draw": None,
-            "task": {"time_limit_s": 15.0, "human_factor": 2.0}, "wall_s": 45.0, "step_deadline_s": 2.0,
-            "max_restarts": 2, "margin": 0.02, "env": dict(ENV), "scene_count": count,
-            "scenes_sha256": verify.scenes_digest(rows), "scenes": rows, "phase1": p1, "phase2": p2, "king": king,
-            "decisive": decisive,
-            "decision": {"king_best": king_best, "king": "5Kate", "phase2_ran": p2 is not None,
-                         "decisive_ran": decisive is not None,
-                         "king_score": ks if king else None, "score": cs if king else None,
-                         "compared": n if king else None, "beats_king": beats, "crowned": status == "crowned"}}
+            "task": {"time_limit_s": 15.0}, "wall_s": 45.0, "step_deadline_s": 2.0,
+            "max_restarts": 2, "margin": 0.0, "env": dict(ENV), "scene_count": count,
+            "scenes_sha256": verify.scenes_digest(rows), "scenes": rows, "phase1": p1, "phase2": p2,
+            "decision": {"round": 3, "bar": bar, "rank_at": 2 if status == "ranked" else None, "new": new}}
 
 
-def test_crowned_needs_a_passed_decisive_recheck(capsys, env, tmp_path):
-    doc = make_doc(fake_env(broken=BROKEN), "crowned")
-    assert doc["decisive"]["scenes"] and doc["decisive"]["status"] == "passed"
+def make_v9_doc(e, status="crowned"):
+    """A frozen document from before v10: a king run, a decisive re-check and the old decision."""
+    doc = make_doc(e, {"crowned": "ranked", "not_crowned": "not_ranked"}.get(status, status))
+    doc["submission"]["status"] = status
+    del doc["submission"]["round"]
+    doc["margin"] = 0.02
+    doc["king"] = {"id": "sub-7", "hotkey": "5Kate", "image": KING, "digest": "sha256:" + "c" * 64, "status": "king",
+                   "score": 0.3, "results": {"success": [], "t": [], "outcome": [], "action_hash": []}}
+    doc["decisive"] = {"status": "passed", "scenes": [], "outcome": [], "action_hash": [], "wall_s": []}
+    doc["decision"] = {"king_best": 0.4 if status != "below_king" else doc["phase1"]["score"], "king": "5Kate",
+                       "phase2_ran": doc["phase2"] is not None, "decisive_ran": True, "king_score": 0.3,
+                       "score": 0.8, "compared": 10, "beats_king": status == "crowned", "crowned": status == "crowned"}
+    return doc
+
+
+def problems(capsys, tmp_path, doc):
     code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
-    assert code == 0 and out["decisive"]["passed"] and out["decisive"]["expected"] == doc["decisive"]["scenes"], out
-    bad = _t(doc, _set(["decisive", "action_hash", 0], "1" * 16))
-    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, bad), "--hash-scenes", "0")
-    assert code == 1 and any("decisive re-check did not pass" in p for p in out["document"]["problems"])
-    short = _t(doc, lambda d: [d["decisive"][k].pop() for k in ("scenes", "outcome", "action_hash", "wall_s")])
-    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, short), "--hash-scenes", "0")
-    assert code == 1 and any("not the recomputed decisive scenes" in p for p in out["document"]["problems"])
-    gone = _t(doc, _set(["decisive"], None))
-    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, gone), "--hash-scenes", "0")
-    assert code == 1 and any("no decisive re-check is published" in p for p in out["document"]["problems"])
-    nc = make_doc(fake_env(broken=BROKEN), "not_crowned")
-    assert nc["decisive"] is None
-    nc["decisive"] = doc["decisive"]
-    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, nc), "--hash-scenes", "0")
-    assert code == 1 and any("not_crowned, but a decisive re-check" in p for p in out["document"]["problems"])
+    return code, out["document"]["problems"], out
 
 
-def test_disqualified_at_the_decisive_recheck(capsys, env, tmp_path):
-    doc = make_doc(fake_env(broken=BROKEN), "decisive_failed")
-    assert doc["submission"]["status"] == "disqualified" and doc["king"] is not None
-    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
-    assert code == 0 and out["document"]["problems"] == [] and not out["decisive"]["passed"], out
-    fake = _t(doc, lambda d: (d["decisive"].update(mismatched=[]), d["decisive"]["action_hash"].__setitem__(
-        0, d["phase1"]["results"]["action_hash"][[x["index"] for x in d["scenes"]].index(d["decisive"]["scenes"][0])])))
-    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, fake), "--hash-scenes", "0")
-    assert code == 1 and any("every decisive scene gave phase 1's action hash" in p for p in out["document"]["problems"])
-    nod = _t(doc, _set(["decisive"], None))
-    code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, nod), "--hash-scenes", "0")
-    assert code == 1 and any("disqualified, but a king run is published" in p for p in out["document"]["problems"])
+def test_the_round_decision_is_checked(capsys, env, tmp_path):
+    doc = make_doc(fake_env(broken=BROKEN), "ranked")
+    code, got, out = problems(capsys, tmp_path, doc)
+    assert code == 0 and got == [] and out["decision"] == {"round": 3, "bar": 0.4, "rank_at": 2, "new": 2,
+                                                         "entered": True, "above_bar": True}, out
+    for fn, want in ((_set(["decision", "rank_at"], None), "ranked, but decision.rank_at is null"),
+                     (_set(["decision", "rank_at"], 3), "rank_at 3, but only 2 submissions entered"),
+                     (_set(["decision", "new"], ["sub-50"]), "decision.new does not name sub-42"),
+                     (_set(["decision", "new"], [SID, SID]), "decision.new repeats"),
+                     (_set(["decision", "bar"], 0.99), "is not above the bar 0.99"),
+                     (_set(["decision", "round"], 4), "decision.round 4 is not the submission's round 3"),
+                     (_set(["decision"], None), "ranked, but the document has no decision")):
+        code, got, _ = problems(capsys, tmp_path, _t(doc, fn))
+        assert code == 1 and any(want in p for p in got), (want, got)
+    nr = make_doc(fake_env(broken=BROKEN), "not_ranked")
+    code, got, out = problems(capsys, tmp_path, nr)
+    assert code == 0 and got == [] and out["decision"]["entered"] is False, out
+    for fn, want in ((_set(["decision", "new"], OTHERS[:2]), "only 2 submissions entered at round 3's decision"),
+                     (_set(["decision", "new"], [SID]), "not_ranked, but decision.new names this submission"),
+                     (_set(["decision", "rank_at"], 1), "not_ranked, but decision.rank_at is 1")):
+        code, got, _ = problems(capsys, tmp_path, _t(nr, fn))
+        assert code == 1 and any(want in p for p in got), (want, got)
+    low = _t(nr, lambda d: d["decision"].update(bar=d["phase1"]["score"], new=[]))
+    code, got, _ = problems(capsys, tmp_path, low)
+    assert code == 1 and any("phase 2 ran, but the phase-1 score" in p for p in got), got
+    first = _t(doc, _set(["decision", "bar"], None))
+    assert problems(capsys, tmp_path, first)[:2] == (0, [])
+
+
+def test_documents_from_before_v10_still_check(capsys, env, tmp_path):
+    for st in ("crowned", "not_crowned", "below_king"):
+        doc = make_v9_doc(fake_env(broken=BROKEN), st)
+        code, got, out = problems(capsys, tmp_path, doc)
+        assert code == 0 and got == [] and out["decision"] is None, (st, out["document"])
+        assert any("from before v10" in w for w in out["document"]["warnings"]), out["document"]
+    doc = make_v9_doc(fake_env(broken=BROKEN), "crowned")
+    code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["decision", "king_best"], 0.99)))
+    assert code == 1 and any("is not above the king's best 0.99 + margin 0.02" in p for p in got), got
+    code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["phase2", "action_hash", 0], "1" * 16)))
+    assert code == 1 and any("crowned, but phase 2 did not pass" in p for p in got), got
+    late = _t(doc, lambda d: (d["submission"].update(status="disqualified", reason="1 decisive scene differed"),
+                              d["decision"].update(crowned=False)))
+    assert problems(capsys, tmp_path, late)[:2] == (0, [])
+    low = make_v9_doc(fake_env(broken=BROKEN), "below_king")
+    code, got, _ = problems(capsys, tmp_path, _t(low, _set(["decision", "king_best"], 0.1)))
+    assert code == 1 and any("below_king, but the phase-1 score" in p for p in got), got
 
 
 def test_disqualified_before_phase2_on_our_side(capsys, env, tmp_path):
@@ -199,8 +197,8 @@ def test_disqualified_before_phase2_on_our_side(capsys, env, tmp_path):
 
 def test_margin_ties_are_exact():
     assert 14 / 100 > 12 / 100 + 0.02
-    assert not subverify.beats(14, 12, 100, 0.02) and subverify.beats(15, 12, 100, 0.02)
     assert not subverify.above(0.14, 0.12, 0.02) and subverify.above(0.15, 0.12, 0.02)
+    assert not subverify.above(0.4, 0.4, 0) and subverify.above(0.401, 0.4, 0)
 
 
 BROKEN = {verify.base_seed(SALT, 0, 2) + k for k in range(6)}
@@ -239,15 +237,16 @@ def api(monkeypatch, doc, view=None, final=True):
     return seen
 
 
-@pytest.mark.parametrize("status", ["crowned", "not_crowned", "below_king", "disqualified"])
+@pytest.mark.parametrize("status", ["ranked", "not_ranked", "below_king", "disqualified"])
 def test_every_final_status_adds_up(capsys, env, tmp_path, status):
     doc = make_doc(fake_env(broken=BROKEN), status)
     code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc))
     assert code == 0 and out["ok"] and out["document"]["problems"] == [], out
     assert out["submission"] == SID and out["status"] == status and out["scenes"]["checked"] == doc["scene_count"]
     assert out["scenes"]["skipped_checked"] == 1 and out["scenes"]["mismatched"] == []
+    assert out["decision"]["rank_at"] == (2 if status == "ranked" else None) and "king" not in out
     if status == "below_king":
-        assert out["phase2"] is None
+        assert out["phase2"] is None and out["decision"]["above_bar"] is False
     else:
         assert out["phase2"]["passed"] == (status != "disqualified")
         assert out["phase2"]["mismatched"] == ([doc["phase2"]["scenes"][1]] if status == "disqualified" else [])
@@ -277,14 +276,13 @@ def test_a_rerun_compares_action_hashes(capsys, env, tmp_path):
     r = out["rerun"]
     assert code == 0 and r["role"] == "submission" and r["scenes"] == 5 and r["hash_equal"] == 5, r
     assert r["hash_agreement"] == 1.0 and r["mismatched"] == []
-    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", "king", "--scenes", "4")
-    assert code == 0 and out["rerun"]["role"] == "king" and out["rerun"]["hash_equal"] == 4, out["rerun"]
     code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", "submission", "--command",
                          f"x noisy as {SUB}", "--scenes", "3")
     r = out["rerun"]
     assert code == 0 and r["hash_equal"] == 0 and len(r["mismatched"]) == 3 and r["outcome_agreement"] == 1.0, r
-    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", "ghcr.io/eve/x@sha256:" + "f" * 64)
-    assert code == 2 and f"did not run for submission {SID}" in err
+    for ref in ("ghcr.io/eve/x@sha256:" + "f" * 64, "king"):
+        code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", ref)
+        assert code == 2 and f"is not submission {SID}'s image" in err and "no king run" in err, err
 
 
 def _t(doc, fn):
@@ -303,21 +301,21 @@ def _set(path, v):
 
 
 @pytest.mark.parametrize("status,fn,problem", [
-    ("crowned", _set(["submission", "status"], "phase2"), "not final"),
-    ("crowned", _set(["salt"], "ff" * 16), "not the sha256 of the salt"),
-    ("crowned", _set(["salt_committed_at"], "2026-11-23T02:00:00+00:00"), "after phase 1 started"),
-    ("crowned", _set(["salt_committed_at"], None), "--allow-uncommitted"),
-    ("crowned", _set(["scenes_sha256"], "0" * 64), "scenes_sha256 does not match"),
-    ("crowned", _set(["phase1", "score"], 0.99), "score 0.99 is not"),
-    ("crowned", _set(["king", "score"], 0.95), "king run: score 0.95"),
-    ("crowned", _set(["decision", "king_best"], 0.99), "is not above the king's best 0.99"),
-    ("crowned", _set(["phase2", "action_hash", 0], "1" * 16), "phase 2 did not pass"),
-    ("crowned", _set(["phase2", "wall_s", 0], 99.0), "phase 2 did not pass"),
-    ("crowned", _set(["king"], None), "no king run on the same scenes"),
-    ("crowned", _set(["decision", "crowned"], False), "decision.crowned disagrees"),
-    ("crowned", _set(["submission", "image"], "ghcr.io/alice/bin-expert:latest"), "not an accepted pinned image"),
-    ("not_crowned", _set(["submission", "status"], "crowned"), "says not_crowned"),
-    ("below_king", _set(["decision", "king_best"], 0.1), "below_king, but the phase-1 score"),
+    ("ranked", _set(["submission", "status"], "phase2"), "not final"),
+    ("ranked", _set(["submission", "status"], "passed"), "not final"),
+    ("ranked", _set(["salt"], "ff" * 16), "not the sha256 of the salt"),
+    ("ranked", _set(["salt_committed_at"], "2026-11-23T02:00:00+00:00"), "after phase 1 started"),
+    ("ranked", _set(["salt_committed_at"], None), "--allow-uncommitted"),
+    ("ranked", _set(["scenes_sha256"], "0" * 64), "scenes_sha256 does not match"),
+    ("ranked", _set(["phase1", "score"], 0.99), "score 0.99 is not"),
+    ("ranked", _set(["decision", "bar"], 0.99), "is not above the bar 0.99"),
+    ("ranked", _set(["phase2", "action_hash", 0], "1" * 16), "phase 2 did not pass"),
+    ("ranked", _set(["phase2", "wall_s", 0], 99.0), "phase 2 did not pass"),
+    ("ranked", _set(["decision", "new"], []), "decision.new does not name"),
+    ("ranked", _set(["submission", "image"], "ghcr.io/alice/bin-expert:latest"), "not an accepted pinned image"),
+    ("not_ranked", _set(["submission", "status"], "ranked"), "decision.rank_at is null"),
+    ("below_king", _set(["decision", "bar"], 0.1), "below_king, but the phase-1 score"),
+    ("below_king", _set(["decision", "bar"], None), "no king: every score counts"),
     ("disqualified", lambda d: (d["phase2"].update(reason=None), d["submission"].update(reason=None)),
      "disqualified without a reason"),
     ("disqualified", _set(["phase2", "scenes", 0], 999), "not in the list"),
@@ -372,24 +370,18 @@ def test_infrastructure_failures_are_left_out_as_the_server_does(capsys, env, tm
     pos = {x["index"]: k for k, x in enumerate(plain["scenes"])}
     full = _sample(list(pos))
     p1_infra = (pos[full[0]], pos[full[2]])
-    doc = make_doc(fake_env(broken=BROKEN), "crowned", p1_infra=p1_infra, p2_infra=1, king_infra=(pos[full[4]],))
+    doc = make_doc(fake_env(broken=BROKEN), "ranked", p1_infra=p1_infra, p2_infra=1)
     count, p1, p2 = doc["scene_count"], doc["phase1"], doc["phase2"]
     assert p1["infra"] == 2 and p1["counted"] == count - 2 and p1["score"] == p1["successes"] / (count - 2)
     assert full[0] not in p2["scenes"] and p2["outcome"][0] == "docker_unavailable"
     code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
     assert code == 0 and out["ok"] and out["document"]["problems"] == [], out["document"]
     assert out["phase2"]["infra"] == [p2["scenes"][0]] and out["phase2"]["compared"] == len(p2["scenes"]) - 1
-    assert out["phase2"]["passed"] and out["same_scenes"]["compared"] == count - 3 == doc["decision"]["compared"]
-    assert out["same_scenes"]["score"] == doc["decision"]["score"]
-    assert out["same_scenes"]["king_score"] == doc["king"]["score"] == doc["decision"]["king_score"]
-    old = {"phase1": p1["successes"] / count,
-           "king": sum(doc["king"]["results"]["success"]) / count,
-           "sample": _sample(list(pos))}
+    assert out["phase2"]["passed"] and "same_scenes" not in out
+    old = {"phase1": p1["successes"] / count, "sample": _sample(list(pos))}
     for fn, problem in ((_set(["phase1", "score"], old["phase1"]), "2 infrastructure failures left out"),
-                        (_set(["king", "score"], old["king"]), "king run: score"),
                         (_set(["phase2", "scenes"], old["sample"]), "other scenes than the sample rule picks"),
                         (_set(["phase1", "infra"], 0), "0 infrastructure failures published, 2 in the results"),
-                        (_set(["decision", "compared"], count), f"is not {count - 3}"),
                         (_set(["phase2", "mismatched"], [p2["scenes"][0]]), "infrastructure failures left out")):
         code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, _t(doc, fn)), "--hash-scenes", "0")
         assert code == 1 and any(problem in p for p in out["document"]["problems"]), (problem, out["document"])
@@ -405,23 +397,9 @@ def test_a_phase2_that_only_hit_infrastructure_is_no_pass(capsys, env, tmp_path)
     assert code == 0 and out["phase2"]["compared"] == 0 and not out["phase2"]["passed"], out
 
 
-def test_the_genesis_king_has_no_image(capsys, env, tmp_path):
-    p = write(tmp_path, make_doc(fake_env(broken=BROKEN), "crowned", genesis=True))
-    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--hash-scenes", "0")
-    assert code == 0 and out["ok"] and out["document"]["problems"] == [], out["document"]
-    assert out["document"]["warnings"][0].startswith("king: no image published") and "warning: king: no image" in err
-    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", "king", "--scenes", "3", "--hash-scenes", "0")
-    assert code == 0 and out["rerun"] == {"role": "king", "image": None, "skipped": "no image published"}, out
-    assert "king: no image published; not re-running it" in err
-    doc = make_doc(fake_env(broken=BROKEN), "crowned", genesis=True)
-    doc["king"]["id"] = "sub-7"
-    code, out, _ = run(capsys, "--submission", SID, "--doc", write(tmp_path, doc), "--hash-scenes", "0")
-    assert code == 1 and "king: no image published" in out["document"]["problems"], out["document"]
-
-
 def test_hostile_json_is_refused(capsys, env, tmp_path, monkeypatch):
     doc = make_doc(fake_env(broken=BROKEN))
-    nan = json.dumps(doc).replace('"margin": 0.02', '"margin": NaN')
+    nan = json.dumps(doc).replace('"margin": 0.0', '"margin": NaN')
     for text, msg in ((nan, "NaN"), ("[" * 100000 + "]" * 100000, "not JSON"), ("[1, 2]", "not a verify document")):
         p = tmp_path / "h.json"
         p.write_text(text)
@@ -505,12 +483,11 @@ def _with_sample(doc, sample):
 
 
 def test_phase1_cut_offs_stay_out_of_the_phase2_sample(capsys, env, tmp_path):
-    doc = make_doc(fake_env(broken=BROKEN), "not_crowned")
+    doc = make_doc(fake_env(broken=BROKEN), "not_ranked")
     res, rows = doc["phase1"]["results"], doc["scenes"]
     pos = {x["index"]: k for k, x in enumerate(rows)}
     cut = next(i for i in doc["phase2"]["scenes"] if not res["success"][pos[i]])
     res["outcome"][pos[cut]] = "step_timeout"
-    doc["king"]["results"]["outcome"][pos[cut]] = "step_timeout"
     doc.update(phase2_scenes=6, excluded_outcomes=EXCLUDED, first_step_deadline_s=10.0)
     old = list(doc["phase2"]["scenes"])
     want = _sample([i for i in pos if i != cut])

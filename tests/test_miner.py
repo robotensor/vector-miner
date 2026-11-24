@@ -113,7 +113,7 @@ def test_commit_sends_the_checked_reference(monkeypatch, capsys):
         cli.main(["commit", "--image", f"docker.io/alice/x@{D}", "--no-check", "--dev-api", "http://api"])
 
 
-@pytest.mark.parametrize("status", ["waiting_connection", "phase1", "review", "below_king", "crowned"])
+@pytest.mark.parametrize("status", ["waiting_connection", "phase1", "review", "below_king", "passed", "ranked"])
 def test_commit_refuses_a_hotkey_that_already_has_a_submission(monkeypatch, status):
     alice = Keypair.create_from_uri("//Alice")
     monkeypatch.setattr(cli, "_keypair", lambda a: alice)
@@ -194,15 +194,15 @@ HERE = Path(__file__).resolve().parent
 HOT = Keypair.create_from_uri("//Alice").ss58_address
 
 
-def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys):
+def test_status_shows_progress_queue_phase2_rank_and_verdict(monkeypatch, capsys):
     rows = {HOT: [{"id": "sub-3", "hotkey": HOT, "image": REF, "status": "scored", "committed_at": "2026-11-23T01:00:00Z",
                    "salt_sha256": "c" * 64, "phase1": {"done": 1000, "total": 1000, "score": 0.71}, "queue_position": 2}]}
-    king = {"hotkey": "5King", "best_score": 0.64}
+    ex = {"king": None, "ranks": [], "bar": None, "margin": 0, "rank_shares": [0.7, 0.2, 0.1], "decisions": []}
 
     def handler(req: httpx.Request) -> httpx.Response:
         p = req.url.path
         if p == "/v1/skills/bin-picking/expert":
-            return httpx.Response(200, json={"king": king, "margin": 0.02})
+            return httpx.Response(200, json=ex)
         if p == "/v1/skills/bin-picking/expert/submissions":
             return httpx.Response(200, json={"submissions": rows.get(req.url.params["hotkey"], [])})
         return httpx.Response(404)
@@ -212,23 +212,36 @@ def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys
     cap = capsys.readouterr()
     out = json.loads(cap.out)
     s = out["submissions"][0]
-    assert out["king"] is False and out["king_best"] == 0.64 and out["margin"] == 0.02
+    assert out["king"] is False and out["bar"] is None and out["ranks"] == [] and out["rank"] is None
+    assert "no ranks yet" in out["ranks_note"] and "vector-miner: no ranks yet" in cap.err
+    assert "no king yet, so no bar" in s["verdict"]
+    king = {"submission": "sub-1", "hotkey": "5King", "image": REF, "score": 0.64, "since_round": 2}
+    ex.update(king=king, bar=0.64, ranks=[{"rank": 1, "share": 0.7, "hotkey": "5King", "score": 0.64, "round": 2},
+                                          {"rank": 2, "share": 0.2, "hotkey": "5Two", "score": 0.5, "round": 2}],
+              decisions=[{"round": 3, "bar": 0.66, "new": ["sub-9"], "ranks": []}])
+    assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
+    cap = capsys.readouterr()
+    out = json.loads(cap.out)
+    s = out["submissions"][0]
+    assert out["king_hotkey"] == "5King" and out["king_score"] == 0.64 and out["bar"] == 0.64 and out["margin"] == 0
+    assert [r["rank"] for r in out["ranks"]] == [1, 2] and "ranks_note" not in out
     assert s["phase1"] == {"done": 1000, "total": 1000, "score": 0.71, "successes": None} and s["queue_position"] == 2
-    assert "evaluation queue position 2" in s["verdict"] and "sub-3: phase 1 done: 71.0 %" in cap.err
+    assert "above the bar 64.0 %" in s["verdict"] and "evaluation queue position 2" in s["verdict"]
+    assert "sub-3: phase 1 done: 71.0 %" in cap.err
     rows[HOT][0].update(round=3, evaluates_at="2026-11-30T00:00:00+00:00")
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     s = json.loads(capsys.readouterr().out)["submissions"][0]
-    assert s["round"] == 3 and "round 3 ends at 2026-11-30T00:00:00+00:00, then its evaluation" in s["verdict"]
-    assert out["king_image"] is None and out["king_note"] == "king: no image published"
-    assert "vector-miner: king: no image published" in cap.err
+    assert s["round"] == 3 and "round 3 ends at 2026-11-30T00:00:00+00:00, then its evaluation (the copy, phase 2)" in s["verdict"]
     views = {
         "waiting_connection": ({}, "run vector-miner serve"),
         "phase1": ({"phase1": {"done": 412, "total": 1000}}, "412/1000 scenes"),
-        "below_king": ({"phase1": {"score": 0.6}}, "not above the king's best 64.0 %"),
+        "below_king": ({"phase1": {"score": 0.6}}, "not above the bar 64.0 %"),
         "phase2": ({}, "every action hash must equal phase 1's"),
-        "king_run": ({"king_run": {"done": 300, "total": 1000}}, "king's image is running on your scenes (300/1000)"),
-        "crowned": ({"phase1": {"score": 0.71}, "king_run": {"score": 0.62}}, "crowned: 71.0 % against the king's 62.0 %"),
-        "not_crowned": ({"phase1": {"score": 0.71}, "king_run": {"score": 0.7}}, "not crowned"),
+        "passed": ({"round": 3}, "phase 2 passed · decided when round 3 is"),
+        "ranked": ({"rank": 1, "rank_at": 1}, "rank 1 · 70% of the expert part (the king)"),
+        "not_ranked": ({"round": 3, "phase1": {"score": 0.7}}, "not in round 3's top three"),
+        "crowned": ({}, "crowned (before v10"),
+        "not_crowned": ({}, "not crowned (before v10)"),
         "disqualified": ({"reason": "action hash differs on 3 of 100 scenes"}, "action hash differs on 3 of 100"),
         "abandoned": ({}, "no miner connection within 48 h of the commit; it did not use this hotkey's submission"),
         "invalid": ({"reason": "the image is private"}, "the image is private; it did not use this hotkey's submission"),
@@ -242,15 +255,16 @@ def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys
         assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
         s = json.loads(capsys.readouterr().out)["submissions"][0]
         assert want in s["verdict"], (st, s)
-        assert s["final"] == (st in ("below_king", "crowned", "not_crowned", "disqualified", "abandoned", "invalid",
-                                     "copy"))
-        if st == "king_run":
-            assert s["king_same_scenes"]["done"] == 300
+        assert s["final"] == (st in ("below_king", "ranked", "not_ranked", "crowned", "not_crowned", "disqualified",
+                                     "abandoned", "invalid", "copy"))
         if st == "review":
             assert s["retry_at"] == "2026-11-23T16:00:00+00:00"
     for st, extra, want in (("phase2", {"stage": "copy"}, "we copy your committed image into our registry first"),
-                            ("king_run", {"stage": "decisive", "decisive": {"done": 3, "total": 7}},
-                             "decisive re-check: your image runs in docker on the scenes you won and the king lost (3/7)"),
+                            ("ranked", {"rank": 3}, "rank 3 · 10% of the expert part"),
+                            ("ranked", {"rank": None, "rank_at": 2, "ranked_out_round": 5},
+                             "ranked out in round 5 (entered at rank 2); final"),
+                            ("not_ranked", {"round": 3, "phase1": {"score": 0.65}}, "0.650 not above king 0.660"),
+                            ("not_ranked", {"round": 1, "phase1": {"score": 0.65}}, "not above the king, or not in"),
                             ("disqualified", {"reason": "image no longer available: manifest unknown"},
                              "disqualified: image no longer available: manifest unknown; final")):
         rows[HOT] = [{"id": "sub-3", "hotkey": HOT, "status": st, **extra}]
@@ -261,11 +275,12 @@ def test_status_shows_progress_queue_phase2_king_and_verdict(monkeypatch, capsys
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     v = json.loads(capsys.readouterr().out)["submissions"][0]["verdict"]
     assert v.endswith("it runs again automatically") and "serve" not in v
-    king["hotkey"], king["image"] = HOT, REF
+    king["hotkey"] = HOT
+    ex["ranks"][0]["hotkey"] = HOT
     rows[HOT] = []
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["king_image"] == REF and "king_note" not in out
+    assert out["king_image"] == REF and out["rank"] == 1
     assert out["king"] is True and out["submissions"] == [] and "vector-miner commit" in out["note"]
 
 

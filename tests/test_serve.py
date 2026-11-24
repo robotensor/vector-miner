@@ -167,7 +167,7 @@ def test_ws_url_and_close_codes():
     later = sv.refusal(4403, "not_open: phase 1 hit failures", {"reason": "not_open", "retry_at": "2026-11-23T16:00:00Z"},
                        now=now)
     assert not later["final"] and later["wait_s"] == 6 * 3600 and later["retry_at"] == "2026-11-23T16:00:00Z"
-    over = sv.refusal(4403, "not_open: phase 1 of submission s is over (status crowned)")
+    over = sv.refusal(4403, "not_open: phase 1 of submission s is over (status ranked)")
     assert over["final"] and over["reason"] == "not_open" and over["message"].startswith("phase 1 of submission")
     for code, reason in ((4403, "image: hello.image is not the committed image (x)"),
                          (4404, "unknown: no submission for this hotkey"),
@@ -643,9 +643,9 @@ def test_busy_and_not_open_with_retry_at_are_retried_and_real_refusals_stop(pids
     assert code == 1 and len(srv.hellos) == 1
     assert any("refused this miner (close 4403): image: hello.image is not the committed image" in x for x in logs), logs
     logs.clear()
-    code, srv = run(main([({"reason": "not_open", "message": "phase 1 of submission sub-1 is over (status crowned)",
-                            "status": "crowned"}, 4403, "not_open: phase 1 of submission sub-1 is over")]))
-    assert code == 1 and len(srv.hellos) == 1 and any("is over (status crowned)" in x for x in logs), logs
+    code, srv = run(main([({"reason": "not_open", "message": "phase 1 of submission sub-1 is over (status ranked)",
+                            "status": "ranked"}, 4403, "not_open: phase 1 of submission sub-1 is over")]))
+    assert code == 1 and len(srv.hellos) == 1 and any("is over (status ranked)" in x for x in logs), logs
     logs.clear()
     nonce = ({"reason": "bad_hello", "message": "unknown or expired nonce (GET /v1/expert/nonce)"}, 4401,
              "bad_hello: unknown or expired nonce (GET /v1/expert/nonce)")

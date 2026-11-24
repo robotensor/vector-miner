@@ -15,20 +15,19 @@ flowchart LR
   E --> F["vector-miner commit (once per hotkey, ever)"]
   F --> SV["vector-miner serve: your machine plays 1,000 fresh scenes (phase 1)"]
   SV --> SC["phase-1 score"]
-  SC -->|"not above the king's best + margin"| BK["below_king (final)"]
+  SC -->|"not above the bar (the king's score + margin)"| BK["below_king (final)"]
   SC -->|"above"| RE["waits for the end of its round (the round its phase 1 ended in)"]
-  RE --> Q["the round's evaluation: older rounds first, then highest phase-1 score, one at a time"]
+  RE --> Q["the round's evaluation: in commit order, one at a time"]
   Q --> CP["the subnet copies your image into its registry"]
   CP -->|"the image is gone (deleted, or private and not shared)"| DQ["disqualified"]
   CP --> P2["phase 2: the copy runs in docker on 100 of the scenes"]
   P2 -->|"an action hash differs, or a scene is over the wall"| DQ
-  P2 -->|"all equal"| KR["king run: the king's image on all 1,000 of your scenes"]
-  KR -->|"you > king + 0.02"| DC["decisive re-check: the copy in docker on every scene you won and the king lost"]
-  DC -->|"all equal, within the wall"| CR["crowned"]
-  DC -->|"an action hash differs, or a scene is over the wall"| DQ
-  KR -->|"else"| NC["not_crowned"]
-  CR --> V["vector-miner verify --submission ID"]
-  NC --> V
+  P2 -->|"all equal"| PS["passed: waits for the round decision"]
+  PS --> RD{"round decision: the round's best three above the bar"}
+  RD -->|"in"| RK["ranked: rank 1 (the king) 70 %, rank 2 20 %, rank 3 10 % of the expert part"]
+  RD -->|"out"| NR["not_ranked"]
+  RK --> V["vector-miner verify --submission ID"]
+  NR --> V
   DQ --> V
   BK --> V
 ```
@@ -38,17 +37,26 @@ are drawn from that salt. Phase 1 is played on your machine: `vector-miner serve
 simulator plays every scene against your image step by step, and each scene's rows are hashed (the action hash).
 The subnet runs in rounds (one schedule for miners and contributors; the length is a subnet setting, shown with its
 dates in `GET /v1/skills/bin-picking/expert` as `round`). Your submission belongs to the round in which its phase 1
-ends. A phase-1 score not above the king's best + margin is `below_king` at once; the others wait until their round
-ends, and then that round's evaluation runs while the next round already runs: older rounds first, then the highest
-phase-1 score, one submission at a time, each checked against the king's best again when its turn comes. The subnet
-keeps your phase-1 scenes and results for this. When your submission's turn comes, the subnet first copies your committed image into its
-own registry (until then keep the image public, or private and shared with the subnet's team account with Read
-access: an image the subnet cannot pull then is `disqualified`, "image no longer available"); everything after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of
-those scenes: every action hash must equal phase 1's, or the submission is disqualified. Then the king's image plays
-all 1,000 of your scenes. When you beat the king by more than the margin (0.02) on those same scenes (an exact
-comparison of success counts), the decisive re-check runs your copy again on every scene you won and the king lost
-that phase 2 did not already run: every action hash must equal phase 1's and every scene must fit the wall, or the
-submission is disqualified. Only then does the crown move, automatically.
+ends. Phase 1 alone ranks the scripts: the bar is the king's phase-1 score + `margin` (0), so a score must be
+higher than the king's, and before the first round decision there is no king and no bar (every score counts). A
+phase-1 score not above the bar is `below_king` at once; the others wait until their round ends, and then that
+round's evaluation runs while the next round already runs: in commit order (older round first, then the earlier
+commit block), one submission at a time, each checked against the bar again when its turn comes. The subnet keeps
+your phase-1 scenes and results for this. When your submission's turn comes, the subnet first copies your committed
+image into its own registry (until then keep the image public, or private and shared with the subnet's team account
+with Read access: an image the subnet cannot pull then is `disqualified`, "image no longer available"); everything
+after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of those scenes: every
+action hash must equal phase 1's, or the submission is disqualified. A submission that passes phase 2 is `passed`.
+There is no king run and no re-check against the king.
+
+When every submission of the round is final or `passed`, the round is decided. The ranks are a window of at most
+three submissions, rank 1 (the king) first, paid 70 %, 20 % and 10 % of the expert part of the weights
+(`rank_shares` in `GET /v1/skills/bin-picking/expert`). The round's `passed` submissions above the bar enter, best
+phase-1 score first (ties: the earlier commit block), at most three: the best new one becomes the king and each new
+one pushes the lowest old rank out. They are `ranked`; the round's other `passed` submissions are `not_ranked`. A
+ranked submission pushed out later keeps `ranked` with `ranked_out_round`. Example: ranks 0.10, 0.50, 0.70 (rank 3,
+2, 1) and a round bringing 0.70, 0.72 and 0.74: 0.70 is not higher than the king, so 0.72 and 0.74 enter and the
+ranks become 0.70 (rank 3), 0.72 (rank 2), 0.74 (rank 1, the new king). An empty rank's part is burned.
 
 ## Setup
 
@@ -144,7 +152,8 @@ docker pull ghcr.io/<you>/bin-expert@sha256:<digest>
 - Registration costs TAO (burned, the price moves with demand: `subnet burn-cost` shows it, the confirmation prompt
   shows it again) or, when the subnet allows it, a proof of work (`subnet register --pow`). It is not refunded.
 - A full subnet gives each new registration the uid with the lowest emission among those past their immunity period.
-  Only the king earns, so a hotkey without the crown can lose its uid and must register (and pay) again. Check before
+  Only the three ranks earn, so a hotkey without a rank can lose its uid and must register (and pay) again; a rank
+  whose hotkey lost its uid has its part burned. Check before
   the commit that it has one (`.venv/bin/btcli wallet overview --netuid <netuid> --wallet <coldkey>`): a
   commit from a hotkey without a uid is invalid.
 - The testnet trial runs the same checks (without the API check) and sends the same signed call; `{"ok": true, ...}` there means the
@@ -267,25 +276,28 @@ flowchart TD
 .venv/bin/vector-miner status --api https://vector.robotensor.ai --wallet.name <coldkey> --wallet.hotkey <hotkey>
 ```
 
-One JSON object: `king` (whether you are the king), `king_hotkey`, `king_image` (null for the genesis king, which
-runs as a command: `king_note` then says `king: no image published`), `king_best`, `margin`, and `submissions`, each
-with `id`, `image`, `status`, `committed_at`, `salt_sha256`, `phase1 {done, total, score, successes}`,
-`round` (the round its phase 1 ended in), `evaluates_at` (when that round ends, while it is ahead),
-`queue_position` (evaluation order: older round first, then highest phase-1 score), `phase2`, `king_same_scenes {hotkey, image, done,
-total, score}` (the king's run on your scenes), `reason`, `retry_at`, `final` and `verdict` (one line, also printed
-to stderr).
+One JSON object: `king` (whether you are the king, rank 1), `rank` (your hotkey's rank now, or null),
+`king_hotkey`, `king_image`, `king_score` (its phase-1 score), `bar` (the king's score + margin; null before the first
+round decision, when `ranks_note` says so), `margin`, `ranks` (`[{rank, share, hotkey, score, round}]`, rank 1
+first), and `submissions`, each with `id`, `image`, `status`, `committed_at`, `salt_sha256`,
+`phase1 {done, total, score, successes}`, `round` (the round its phase 1 ended in), `evaluates_at` (when that round
+ends, while it is ahead), `queue_position` (evaluation order: commit order, older round first), `phase2`, `stage`,
+`rank` (its place in the ranks now), `rank_at` (the rank it entered with), `ranked_out_round`, `reason`, `retry_at`,
+`final` and `verdict` (one line, also printed to stderr).
 It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`.
 
 | status | meaning |
 |---|---|
 | `waiting_connection` | committed; run `serve` (abandoned after 48 h without any connection attempt; a refusal because every slot is busy counts as an attempt) |
 | `phase1` | `serve` is playing your scenes: `phase1.done` of `phase1.total`. After the first hour on the socket it must keep up 200 scenes an hour on average (8 at once do ≥ 640), or the rest count as failures and the slot goes to the next miner |
-| `scored` | phase 1 is done and above the king's best + margin: waits for its round to end (`evaluates_at`), then for its turn in the evaluation (`queue_position`) |
-| `below_king` | phase 1 is not above the king's best + margin; final. A queued submission is re-checked after every crowning |
+| `scored` | phase 1 is done and above the bar: waits for its round to end (`evaluates_at`), then for its turn in the evaluation (`queue_position`) |
+| `below_king` | phase 1 is not above the bar (the king's score + margin); final. A queued submission is checked against the bar again when its turn comes (the bar only rises) |
 | `phase2` | `stage` `copy`: we copy your image into our registry; then we run the copy in docker on 100 of your scenes and compare action hashes |
-| `king_run` | phase 2 passed; the king's image plays all your scenes; `stage` `decisive`: the decisive re-check (`decisive {done, total}`) |
-| `crowned` / `not_crowned` | your phase-1 score against the king's on the same scenes, with the margin; final |
-| `disqualified` | phase 2 or the decisive re-check found another action hash or a scene over the wall, the image was gone when we copied it, or a stage failed on our side again after 2 reviews (`reason`); final |
+| `passed` | phase 2 passed; decided when its round is (every submission of the round final or `passed`) |
+| `ranked` | in the ranks after its round's decision: "rank k · 70%" (20 %, 10 %) while it holds one, "ranked out in round m" after; final |
+| `not_ranked` | phase 2 passed but not in the ranks: not above the bar, or not in its round's top three; final |
+| `crowned` / `not_crowned` / `king_run` | before v10 only (older submissions keep them) |
+| `disqualified` | phase 2 found another action hash or a scene over the wall, the image was gone when we copied it, or a stage failed on our side again after 2 reviews (`reason`); final |
 | `duplicate_hotkey` | a second commit from a hotkey that already had one; never evaluated |
 | `invalid` / `copy` | a bad commit, the digest of an earlier submission; neither uses the hotkey's submission, so it may commit again |
 | `abandoned` | no connection attempt within 48 h; final, and it does not use the hotkey's submission: the hotkey may commit again |
@@ -304,7 +316,7 @@ vector-miner serve --image REF [--api URL] [--concurrency 8] [--warm N] [--comma
                    [--docker docker] [--pull] [--stderr DIR] [--wallet.name --wallet.hotkey --wallet.path]
 vector-miner status [--api URL] [--hotkey <ss58>] [--wallet.name --wallet.hotkey]
 vector-miner verify --submission ID (--api URL | --doc FILE) [--save FILE] [--hash-scenes M]
-                    [--image REF|submission|king [--command "..."] [--scenes 20] [--sample-seed 0] [--workers 1]
+                    [--image REF|submission [--command "..."] [--scenes 20] [--sample-seed 0] [--workers 1]
                     [--wall S] [--cpus 4] [--memory 8g] [--docker docker] [--pull]] [--salt-sha256 HEX]
                     [--allow-uncommitted]
 ```
@@ -366,12 +378,13 @@ and a `summary`; vector-env's README lists every field. The scene's seed is the 
 
 ## Verify a submission
 
-Once a submission is final (`below_king`, `crowned`, `not_crowned` or `disqualified`), the API publishes everything
-needed to check it at `GET /v1/skills/bin-picking/expert/submissions/<id>/verify` (404 until then): the salt and
-its commitment, the vector-env version and asset sha256 the scenes were made with, every scene's seed and state
-hash, phase 1 (score and per-scene success, time, outcome, action hash), phase 2 (the scenes, their action hashes
-and wall times), the king's run on the same scenes, the decisive re-check (its scenes, action hashes and wall times)
-and the decision; `submission.mirror_url` is the subnet's copy of the image.
+Once a submission is final (`below_king`, `ranked`, `not_ranked` or `disqualified`; `passed` waits for its round's
+decision), the API publishes everything needed to check it at
+`GET /v1/skills/bin-picking/expert/submissions/<id>/verify` (404 until then): the salt and its commitment, the
+vector-env version and asset sha256 the scenes were made with, every scene's seed and state hash, phase 1 (score and
+per-scene success, time, outcome, action hash), phase 2 (the scenes, their action hashes and wall times) and the
+decision `{round, bar, rank_at, new}` (the bar, the rank it entered with, the submission ids that entered at its
+round's decision); `submission.mirror_url` is the subnet's copy of the image. There is no king run to check.
 
 ```mermaid
 flowchart LR
@@ -380,7 +393,7 @@ flowchart LR
   S --> SD["seed i = sha256(salt:0:i)[:6] + k"]
   SD --> G["vector-env: generate the scene"]
   G --> H{"seed and state hash = published?"}
-  D["published phase 1, phase 2, king run, decisive"] --> C{"scores, phase-2 and decisive hashes, gate, crown add up?"}
+  D["published phase 1, phase 2, decision"] --> C{"scores, phase-2 hashes, bar and rank add up?"}
   G --> R["--image: run an image on K sampled scenes"]
   R --> A{"action hash = published?"}
 ```
@@ -393,9 +406,8 @@ flowchart LR
 .venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai --hash-scenes 100 \
   --image submission --scenes 20 --pull
 
-# the king's image on the same scenes; the salt commitment you noted at commit time
-.venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai --image king --scenes 10 \
-  --salt-sha256 <64 hex>
+# with the salt commitment you noted at commit time
+.venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai --salt-sha256 <64 hex>
 ```
 
 - Seeds: scene `i` uses `int.from_bytes(sha256(f"{salt}:0:{i}").digest()[:6], "big")`, vector-env's
@@ -411,7 +423,8 @@ flowchart LR
   `sha256("\n".join(f"{index}:{seed}:{state_hash}"))`, the phase-1 score is successes / scenes with a verdict
   (infrastructure failures, an `INFRA_OUTCOMES` outcome or none, are left out; `not_run` and timeouts count as
   failures), mean times match the successful scenes; `below_king` needs a phase-1 score not above
-  `decision.king_best` + `margin` and no phase 2; any other final status needs one above it and a phase 2 on the
+  `decision.bar` (a null bar: no king, every score counts) and no phase 2; any other final status needs one above it
+  and a phase 2 on the
   sample rule's scenes: the `phase2_scenes` (100) indexes with the smallest `sha256(f"{salt}:phase2:{index}")`,
   sorted, among the phase-1 scenes with an action hash and an outcome not in `excluded_outcomes` (the
   infrastructure outcomes, `not_run` and the cut-offs `step_timeout`, `disconnected`, `wall_timeout`; a document
@@ -419,23 +432,24 @@ flowchart LR
   infrastructure failures and `not_run` left out). Each phase-2 scene has an outcome, an action hash and a wall
   time; phase-2 infrastructure failures are left out of the
   comparison, and it passes when at least one scene is compared, every hash equals phase 1's and no scene is a
-  `wall_timeout` or over `wall_s`; `disqualified` needs a phase 2 that did not pass and a reason, or a failed
-  decisive re-check after a passed phase 2 and a king run it beat, or a reason that starts with `image no longer
-  available` / `repeated failures on our side` (then nothing after phase 1 is needed); `crowned` and `not_crowned`
-  need phase 2 passed and a king run, whose score and `decision.score` are successes on the scenes where both runs
-  gave a verdict, and `crowned` exactly when (successes − king successes) / compared is above `margin` (exact
-  fractions; the gate is compared the same way). The decisive scenes are recomputed: both runs gave a verdict, the
-  submission succeeded and the king did not, not in `phase2.scenes`; `crowned` needs a `decisive` section on exactly
-  those scenes with phase 1's action hashes, none over `wall_s`; `not_crowned` has none.
-  Images must be `ghcr.io/<repo>@sha256:<digest>` with their own `digest`; the genesis king (no `id`) runs as a
-  command and has no image: a warning `king: no image published`, and `--image king` skips the re-run.
-- `--image` takes `submission`, `king`, or that image's reference, digest or hotkey; it runs the image (or
+  `wall_timeout` or over `wall_s`; `disqualified` needs a phase 2 that did not pass and a reason, or a reason
+  that starts with `image no longer available` / `repeated failures on our side` (then nothing after phase 1 is
+  needed); `ranked` and `not_ranked` need phase 2 passed. The decision: `decision.round` is the submission's
+  `round`; `ranked` needs its id in `decision.new` (at most three, no repeats) and a `rank_at` within the entered
+  ones (the new ones take ranks 1 to n); every other status has no `rank_at` and is not in `new`; a `not_ranked`
+  score above the bar needs three others to have entered (`new` full). The other submissions' scores are not in the
+  document, so the order within `new` is not recomputed.
+  Images must be `ghcr.io/<repo>@sha256:<digest>` with their own `digest`.
+- A document frozen before v10 (`crowned` / `not_crowned`, or one with `king`, `decisive` or `decision.king_best`
+  and no `decision.bar`) is still read: phase 1, phase 2 and the old gate (`decision.king_best` + `margin`) are checked, and a warning says
+  its king run and decisive re-check are not (v10 has none).
+- `--image` takes `submission`, or the submission image's reference, digest or hotkey; it runs the image (or
   `--command` instead) on `--scenes` scenes with a published verdict that is not a cut-off, sampled with `--sample-seed`, and reports
   `hash_equal`, `hash_agreement`, `outcome_agreement` and every scene whose action hash differs. A deterministic
   image gives the published hashes on any machine. Re-run differences do not change the exit code.
 - `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched`, `over_wall`, `infra`,
-  `passed`; `decisive` the decisive re-check: `scenes`, `equal`, `mismatched`, `over_wall`, `infra`, `expected` (the
-  recomputed decisive scenes), `passed`; `same_scenes` repeats the decision: `compared`, `score`, `king_score`.
+  `passed`; `decision` the round decision: `round`, `bar`, `rank_at`, `new` (how many entered), `entered`,
+  `above_bar` (null for a document from before v10).
 - The document is read as strict JSON (no NaN), at most 64 MB, and every field is type-checked first.
 - Regeneration needs the same vector-env version and asset bundle as the submission (`env` in the document, or a
   scene's own `env` when it was made with another one); with another one, the output warns, and a scene whose
@@ -446,8 +460,8 @@ flowchart LR
   commitment time included, unless `--allow-uncommitted`) or a scene mismatch (listed in the output); 2 = cannot
   check: a bad argument (no `--submission`, `--command` without `--image`, no `--api` without `--doc`, a `--doc`
   that is unreadable or of another submission, `--workers` below 1, a malformed `--salt-sha256`), a malformed,
-  non-JSON or oversized document, the submission is not final (404) or the API failed, an image that did not run
-  for the submission, vector-env is missing or its generator does not work here, the pull failed or the re-run
+  non-JSON or oversized document, the submission is not final (404) or the API failed, an `--image` that is not
+  the submission's, vector-env is missing or its generator does not work here, the pull failed or the re-run
   could not run (docker missing, every scene an infra outcome), or scenes are `unverified` (the output is printed).
   Re-run differences are reported under `rerun` and do not change the exit code.
 

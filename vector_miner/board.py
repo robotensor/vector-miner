@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-FINAL = ("below_king", "crowned", "not_crowned", "disqualified", "duplicate_hotkey", "invalid", "copy", "abandoned")
+FINAL = ("below_king", "ranked", "not_ranked", "disqualified", "duplicate_hotkey", "invalid", "copy", "abandoned",
+         "crowned", "not_crowned")
 NO_SLOT = ("duplicate_hotkey", "invalid", "copy", "abandoned")
+SHARES = (0.7, 0.2, 0.1)
 
 
 def _num(v):
@@ -12,57 +14,79 @@ def _pct(v) -> str:
     return "?" if _num(v) is None else f"{100 * float(v):.1f} %"
 
 
+def _f3(v) -> str:
+    return "?" if _num(v) is None else f"{float(v):.3f}"
+
+
 def phase1(s: dict) -> dict:
     p = s.get("phase1") if isinstance(s.get("phase1"), dict) else {}
     return {"done": _num(p.get("done")), "total": _num(p.get("total")), "score": _num(p.get("score", s.get("score"))),
             "successes": _num(p.get("successes"))}
 
 
-def king_same(s: dict) -> dict | None:
-    k = s.get("king_run") if isinstance(s.get("king_run"), dict) else None
-    if k is None:
-        return None
-    return {"hotkey": k.get("hotkey"), "image": k.get("image"), "done": _num(k.get("done")),
-            "total": _num(k.get("total")), "score": _num(k.get("score"))}
+def _share(rank, shares) -> str:
+    k = rank - 1 if isinstance(rank, int) and not isinstance(rank, bool) else -1
+    return f"{100 * float(shares[k]):g}%" if 0 <= k < len(shares) and _num(shares[k]) is not None else "?"
 
 
-def verdict(s: dict, king: dict, margin: float | None) -> str:
-    st, p1 = s.get("status"), phase1(s)
-    best, m = _num(king.get("best_score", king.get("score"))), margin if margin is not None else 0.02
-    kr, why = king_same(s) or {}, s.get("reason")
+def _decided(ex: dict, rnd) -> dict | None:
+    for d in ex.get("decisions") or []:
+        if isinstance(d, dict) and rnd is not None and d.get("round") == rnd:
+            return d
+    return None
+
+
+def verdict(s: dict, ex: dict) -> str:
+    st, p1, rnd = s.get("status"), phase1(s), s.get("round")
+    bar, why = _num(ex.get("bar")), s.get("reason")
+    shares = ex.get("rank_shares") if isinstance(ex.get("rank_shares"), list) else list(SHARES)
     if st == "waiting_connection":
         return ("waiting for your miner: run vector-miner serve --image <your image> so phase 1 can start "
                 "(abandoned after 48 h without a connection)")
     if st == "phase1":
         return f"phase 1: {p1['done'] or 0}/{p1['total'] or 1000} scenes played against your miner; keep serve running"
     if st == "scored":
-        q, rnd, at = s.get("queue_position"), s.get("round"), s.get("evaluates_at")
+        q, at = s.get("queue_position"), s.get("evaluates_at")
         line = f"phase 1 done: {_pct(p1['score'])}"
-        if best is not None:
-            line += f"; it beats the king's best {_pct(best)} by more than the margin {m:g}"
+        line += f"; above the bar {_pct(bar)} (the king's score + margin)" if bar is not None else "; no king yet, so no bar"
         if at:
-            return line + (f"; round {rnd} ends at {at}, then its evaluation (phase 2, the king's run) starts"
+            return line + (f"; round {rnd} ends at {at}, then its evaluation (the copy, phase 2) starts"
                            + (f"; evaluation order {q}" if q is not None else ""))
         return line + (f"; evaluation queue position {q}" if q is not None else "; waiting for its evaluation")
     if st == "below_king":
-        return (f"phase 1 scored {_pct(p1['score'])}, not above the king's best {_pct(best)} + margin {m:g}: "
+        return (f"phase 1 scored {_pct(p1['score'])}, not above the bar {_pct(bar)} (the king's score + margin): "
                 "no phase 2, final")
     if st == "phase2" and s.get("stage") == "copy":
         return ("phase 2 starts: we copy your committed image into our registry first (keep it pullable until then: "
                 "public, or shared with the team account; a deleted image is disqualified)")
     if st == "phase2":
         return "phase 2: we run your committed image in docker (--network none) on 100 of your scenes; every action hash must equal phase 1's"
-    if st == "king_run" and s.get("stage") == "decisive":
-        d = s.get("decisive") if isinstance(s.get("decisive"), dict) else {}
-        return (f"decisive re-check: your image runs in docker on the scenes you won and the king lost "
-                f"({d.get('done') or 0}/{d.get('total') or 0}); every action hash must equal phase 1's")
-    if st == "king_run":
-        return f"phase 2 passed; the king's image is running on your scenes ({kr.get('done') or 0}/{kr.get('total') or p1['total'] or 1000})"
+    if st == "passed":
+        return (f"phase 2 passed · decided when round {rnd if rnd is not None else '?'} is (once every submission of "
+                "that round is final or passed: the best three above the bar take ranks 1-3)")
+    if st == "ranked":
+        now, out = s.get("rank"), s.get("ranked_out_round")
+        if isinstance(now, int) and not isinstance(now, bool):
+            return f"rank {now} · {_share(now, shares)} of the expert part" + (" (the king)" if now == 1 else "")
+        if out is not None:
+            at = s.get("rank_at")
+            return f"ranked out in round {out}" + (f" (entered at rank {at})" if at is not None else "") + "; final"
+        return "ranked"
+    if st == "not_ranked":
+        d = _decided(ex, rnd)
+        b = _num(d.get("bar")) if d else None
+        if d is not None and b is not None and p1["score"] is not None and not float(p1["score"]) > float(b):
+            return f"not ranked: {_f3(p1['score'])} not above king {_f3(b)}; final"
+        if d is not None:
+            return f"not ranked: not in round {rnd}'s top three; final"
+        return (f"not ranked at round {rnd if rnd is not None else '?'}'s decision (not above the king, or not in the "
+                "round's top three); final")
     if st == "crowned":
-        return f"crowned: {_pct(p1['score'])} against the king's {_pct(kr.get('score'))} on the same scenes"
+        return "crowned (before v10: ranks replaced crowns); final"
     if st == "not_crowned":
-        return (f"not crowned: {_pct(p1['score'])} is not above the king's {_pct(kr.get('score'))} + margin {m:g} on "
-                "the same scenes; final")
+        return "not crowned (before v10); final"
+    if st == "king_run":
+        return "king run (before v10; no longer used)"
     if st == "disqualified":
         return f"disqualified: {why or 'no reason given'}; final"
     if st == "duplicate_hotkey":
@@ -77,7 +101,7 @@ def verdict(s: dict, king: dict, margin: float | None) -> str:
         at = s.get("retry_at")
         line = "review: being re-run because of a problem on our side, not your expert's"
         line += f"; it runs again at {at}" if at else "; it runs again automatically"
-        if not s.get("phase2") and not s.get("king_run"):
+        if not s.get("phase2"):
             line += "; keep vector-miner serve running so phase 1 can finish"
         return line
     if st == "abandoned":
@@ -86,26 +110,29 @@ def verdict(s: dict, king: dict, margin: float | None) -> str:
     return f"status {st}"
 
 
-def view(s: dict, king: dict, margin: float | None) -> dict:
+def view(s: dict, ex: dict) -> dict:
     return {"id": s.get("id"), "image": s.get("image"), "status": s.get("status"),
             "committed_at": s.get("committed_at"), "salt_sha256": s.get("salt_sha256"), "phase1": phase1(s),
             "round": s.get("round"), "evaluates_at": s.get("evaluates_at"),
-            "queue_position": s.get("queue_position"), "phase2": s.get("phase2"), "king_same_scenes": king_same(s),
-            "stage": s.get("stage"), "decisive": s.get("decisive"),
+            "queue_position": s.get("queue_position"), "phase2": s.get("phase2"), "stage": s.get("stage"),
+            "rank": s.get("rank"), "rank_at": s.get("rank_at"), "ranked_out_round": s.get("ranked_out_round"),
             "reason": s.get("reason"), "retry_at": s.get("retry_at"), "final": s.get("status") in FINAL,
-            "verdict": verdict(s, king, margin)}
+            "verdict": verdict(s, ex)}
 
 
 def status(api, hotkey: str) -> dict:
     ex = api.expert()
     king = ex.get("king") if isinstance(ex.get("king"), dict) else {}
-    margin = _num(ex.get("margin"))
-    subs = [view(s, king, margin) for s in api.submissions(hotkey)]
-    out = {"hotkey": hotkey, "king": king.get("hotkey") == hotkey, "king_hotkey": king.get("hotkey"),
-           "king_image": king.get("image"), "king_best": _num(king.get("best_score", king.get("score"))),
-           "margin": margin, "submissions": subs}
-    if king and not king.get("image"):
-        out["king_note"] = "king: no image published"
+    ranks = [r for r in (ex.get("ranks") or []) if isinstance(r, dict)]
+    subs = [view(s, ex) for s in api.submissions(hotkey)]
+    mine = [r.get("rank") for r in ranks if r.get("hotkey") == hotkey]
+    out = {"hotkey": hotkey, "king": bool(king) and king.get("hotkey") == hotkey, "rank": mine[0] if mine else None,
+           "king_hotkey": king.get("hotkey"), "king_image": king.get("image"), "king_score": _num(king.get("score")),
+           "bar": _num(ex.get("bar")), "margin": _num(ex.get("margin")),
+           "ranks": [{k: r.get(k) for k in ("rank", "share", "hotkey", "score", "round")} for r in ranks],
+           "submissions": subs}
+    if not ranks:
+        out["ranks_note"] = "no ranks yet: the first decided round fills ranks 1-3, and every score counts until then"
     if not subs:
         out["note"] = "no submission from this hotkey yet: vector-miner commit --image <image@sha256:...>, then vector-miner serve"
     return out

@@ -18,12 +18,13 @@ except ImportError:
 
 FORMAT = "vector-submission-verify/1"
 SEED_N = 0
-FINAL = ("below_king", "crowned", "not_crowned", "disqualified")
+FINAL = ("below_king", "ranked", "not_ranked", "disqualified", "crowned", "not_crowned")
+LEGACY = ("crowned", "not_crowned")
+RANKS = 3
 HASH = re.compile(r"^[0-9a-f]{16}$")
 INFRA = frozenset(INFRA_OUTCOMES)
 NOT_RUN = "not_run"
 CUT_OFF = frozenset({"step_timeout", "disconnected", "wall_timeout"})
-GENESIS_KING = "king: no image published"
 OUR_SIDE = ("image no longer available", "repeated failures on our side")
 
 
@@ -37,10 +38,6 @@ def margin_frac(m) -> Fraction:
 
 def above(score, best, margin) -> bool:
     return frac(score or 0) > frac(best or 0) + margin_frac(margin)
-
-
-def beats(c_ok: int, k_ok: int, n: int, margin) -> bool:
-    return n > 0 and Fraction(int(c_ok) - int(k_ok), int(n)) > margin_frac(margin)
 
 
 def ended_on_our_side(doc: dict) -> bool:
@@ -136,34 +133,16 @@ def validate(doc: dict) -> None:
             _ints(p2.get(f), f"phase2.{f}")
         for j, v in enumerate(_arr(p2.get("wall_s"), "phase2.wall_s", MAX_SCENES)):
             _num(v, f"phase2.wall_s[{j}]")
-    d = _obj(doc.get("decisive"), "decisive")
-    if d:
-        _str(d.get("status"), "decisive.status", 64)
-        _str(d.get("reason"), "decisive.reason", 2000)
-        for j, v in enumerate(_arr(d.get("scenes"), "decisive.scenes", MAX_SCENES)):
-            _int(v, f"decisive.scenes[{j}]", 0, 2 * MAX_SCENES)
-        for j, v in enumerate(_arr(d.get("action_hash"), "decisive.action_hash", MAX_SCENES)):
-            _hash(v, f"decisive.action_hash[{j}]")
-        for j, v in enumerate(_arr(d.get("outcome"), "decisive.outcome", MAX_SCENES)):
-            _str(v, f"decisive.outcome[{j}]", 64)
-        for f in ("mismatched", "wall_timeouts"):
-            _ints(d.get(f), f"decisive.{f}")
-        for j, v in enumerate(_arr(d.get("wall_s"), "decisive.wall_s", MAX_SCENES)):
-            _num(v, f"decisive.wall_s[{j}]")
     _str(sub.get("mirror_url"), "submission.mirror_url")
-    k = _obj(doc.get("king"), "king")
-    if k:
-        _who(k, "king")
-        _num(k.get("score"), "king.score")
-        _num(k.get("mean_time_s"), "king.mean_time_s")
-        _int(k.get("successes"), "king.successes", 0, MAX_SCENES, null=True)
-        _results(_obj(k.get("results"), "king.results", null=False), "king.results")
+    _int(sub.get("round"), "submission.round", 0, 1 << 31, null=True)
     dec = _obj(doc.get("decision"), "decision")
-    for f in ("king_best", "king_score", "score"):
-        _num(dec.get(f), f"decision.{f}")
-    _int(dec.get("compared"), "decision.compared", 0, MAX_SCENES, null=True)
-    _str(dec.get("king"), "decision.king")
-    for f in ("phase2_ran", "decisive_ran", "beats_king", "crowned"):
+    _int(dec.get("round"), "decision.round", 0, 1 << 31, null=True)
+    _num(dec.get("bar"), "decision.bar")
+    _int(dec.get("rank_at"), "decision.rank_at", 1, RANKS, null=True)
+    for j, v in enumerate(_arr(dec.get("new"), "decision.new", RANKS, null=True)):
+        _str(v, f"decision.new[{j}]", null=False)
+    _num(dec.get("king_best"), "decision.king_best")
+    for f in ("phase2_ran", "crowned"):
         _flag(dec.get(f), f"decision.{f}")
 
 
@@ -252,62 +231,6 @@ def _score(name: str, part: dict, count: int) -> list[str]:
     return bad + _times(name, part)
 
 
-def same_scenes(doc: dict) -> dict | None:
-    p1, king = doc["phase1"]["results"], doc.get("king") or None
-    count = len(doc["scenes"])
-    if _lengths("phase 1", doc["phase1"], count) or (king is not None and _lengths("king run", king, count)):
-        return None
-    kr = king["results"] if king else None
-    pairs = [k for k in range(count) if _verdict(p1, k) and (kr is None or (
-        kr["outcome"][k] != NOT_RUN and _verdict(kr, k)))]
-    n = len(pairs)
-    c_ok = sum(1 for k in pairs if p1["success"][k])
-    k_ok = sum(1 for k in pairs if kr["success"][k]) if kr is not None else 0
-    return {"compared": n, "left_out": count - n, "successes": c_ok, "score": c_ok / n if n else 0.0,
-            "king_successes": k_ok if kr is not None else None,
-            "king_score": (k_ok / n if n else 0.0) if kr is not None else None, "pairs": pairs}
-
-
-def decisive_set(doc: dict) -> list[int] | None:
-    same, king = same_scenes(doc), doc.get("king") or None
-    if same is None or king is None:
-        return None
-    p1, kr = doc["phase1"]["results"], king["results"]
-    seen = set((doc.get("phase2") or {}).get("scenes") or [])
-    rows = doc["scenes"]
-    return sorted(rows[k]["index"] for k in same["pairs"] if p1["success"][k] and not kr["success"][k]
-                  and rows[k]["index"] not in seen)
-
-
-def decisive_check(doc: dict) -> dict | None:
-    d = doc.get("decisive") or None
-    if d is None:
-        return None
-    pos = {x["index"]: k for k, x in enumerate(doc["scenes"])}
-    idx, hs, ws, outs = d.get("scenes") or [], d.get("action_hash") or [], d.get("wall_s") or [], d.get("outcome") or []
-    pub = doc["phase1"]["results"].get("action_hash") or []
-    cap = doc.get("wall_s")
-    mism, over, unknown, infra = [], [], [], []
-    for j, i in enumerate(idx):
-        if i not in pos or pos[i] >= len(pub):
-            unknown.append(i)
-            continue
-        o = outs[j] if j < len(outs) else None
-        if o == NOT_RUN or is_infra(o, False):
-            infra.append(i)
-            continue
-        h, p = (hs[j] if j < len(hs) else None), pub[pos[i]]
-        if p is None or h != p:
-            mism.append(i)
-        w = ws[j] if j < len(ws) else None
-        if o == "wall_timeout" or (cap is not None and float(w or 0.0) > float(cap)):
-            over.append(i)
-    want = decisive_set(doc)
-    return {"scenes": len(idx), "equal": len(idx) - len(unknown) - len(infra) - len(mism), "mismatched": mism,
-            "over_wall": over, "infra": infra, "unknown": unknown, "expected": want,
-            "passed": not mism and not over and not unknown and not infra, "status": d.get("status")}
-
-
 def phase2_check(doc: dict) -> dict | None:
     p2 = doc.get("phase2") or None
     if p2 is None:
@@ -372,86 +295,59 @@ def _sample_problems(doc: dict, p2: dict) -> list[str]:
     return []
 
 
-def _king(king: dict, count: int, dec: dict, warnings: list) -> list[str]:
-    bad = _lengths("king run", king, count)
-    if bad:
-        return bad
-    ok = sum(1 for v in king["results"]["success"] if v)
-    if king.get("successes") is not None and ok != king["successes"]:
-        bad.append(f"king run: {king['successes']} successes published, {ok} in the results")
-    bad += _times("king run", king)
-    why = pin_problem(king)
-    if why and king.get("image") is None and king.get("id") is None:
-        warnings.append(f"{GENESIS_KING} (the genesis king runs as a command; its run cannot be repeated here)")
-    elif why:
-        bad.append(f"king: {why}")
-    if dec.get("king") is not None and dec["king"] != king.get("hotkey"):
-        bad.append(f"the decision's king is {dec['king']}, the king run is {king.get('hotkey')}")
-    return bad
+def is_legacy(doc: dict) -> bool:
+    dec = doc.get("decision") if isinstance(doc.get("decision"), dict) else {}
+    sub = doc.get("submission") if isinstance(doc.get("submission"), dict) else {}
+    old = "king" in doc or "decisive" in doc or "king_best" in dec
+    return sub.get("status") in LEGACY or (old and "bar" not in dec and "rank_at" not in dec)
 
 
-def _decision(doc: dict, st: str, margin: float) -> list[str]:
-    same, king, dec = same_scenes(doc), doc.get("king") or None, doc.get("decision") or {}
-    if same is None:
-        return []
-    bad, n, cs, ks = [], same["compared"], same["score"], same["king_score"]
-    if king is not None and not _near(king.get("score"), ks):
-        bad.append(f"king run: score {king.get('score')} is not {same['king_successes']}/{n}, its successes on the "
-                   "scenes where both runs gave a verdict")
-    if dec.get("score") is not None and not _near(dec["score"], cs):
-        bad.append(f"decision.score {dec['score']} is not {same['successes']}/{n}, the phase-1 successes on the scenes "
-                   "where both runs gave a verdict")
-    if dec.get("compared") is not None and dec["compared"] != n:
-        bad.append(f"decision.compared {dec['compared']} is not {n}, the scenes where both runs gave a verdict")
-    if dec.get("king_score") is not None and (ks is None or not _near(dec["king_score"], ks)):
-        bad.append(f"decision.king_score {dec['king_score']} is not the king run's {ks}")
-    win = beats(same["successes"], same["king_successes"] or 0, n, margin)
-    if win != bool(dec.get("beats_king")):
-        bad.append(f"beats_king should be {win}")
-    if st == "disqualified":
-        if not win:
-            bad.append(f"disqualified after the king run, but {cs} against the king's {ks or 0.0} + margin {margin} "
-                       "does not beat the king, so no decisive re-check should have run")
-        return bad
-    if (st == "crowned") != win:
-        bad.append(f"{st}, but {cs} against the king's {ks or 0.0} + margin {margin} on the same {n} scenes says "
-                   f"{'crowned' if win else 'not_crowned'}")
-    return bad
-
-
-def _decisive_problems(doc: dict, st: str) -> list[str]:
-    d, king = decisive_check(doc), doc.get("king") or None
+def eligible(doc: dict) -> bool:
+    """The phase-1 score is above the bar (v10: decision.bar, the king's score + margin; null: no king, every score
+    counts). A document from before v10 has decision.king_best and the margin instead."""
     dec = doc.get("decision") or {}
-    bad = []
-    if dec.get("decisive_ran") is not None and bool(dec["decisive_ran"]) != (d is not None):
-        bad.append("decision.decisive_ran disagrees with the decisive section")
-    if king is None:
-        if d is not None:
-            bad.append("a decisive re-check is published without a king run")
-        return bad
-    if st == "not_crowned":
-        if d is not None:
-            bad.append("not_crowned, but a decisive re-check is published (it runs only when the king is beaten)")
-        return bad
-    if d is None:
-        if "decisive" in doc:
-            bad.append(f"{st}, but no decisive re-check is published")
-        return bad
-    if d["expected"] is not None and sorted(doc["decisive"].get("scenes") or []) != d["expected"]:
-        bad.append(f"decisive.scenes {sorted(doc['decisive'].get('scenes') or [])[:10]} are not the recomputed "
-                   f"decisive scenes {d['expected'][:10]} (won in phase 1, lost by the king, not in phase 2)")
-    if any(len(doc["decisive"].get(k) or []) != d["scenes"] for k in ("outcome", "action_hash", "wall_s")):
-        bad.append("decisive needs one outcome, one action_hash and one wall_s per scene")
-    for f, mine in (("mismatched", d["mismatched"]), ("wall_timeouts", d["over_wall"])):
-        have = doc["decisive"].get(f)
-        if have is not None and sorted(have) != sorted(mine):
-            bad.append(f"decisive.{f} {sorted(have)[:10]} is not {sorted(mine)[:10]}, the recomputed list")
-    if st == "crowned" and not d["passed"]:
-        bad.append(f"crowned, but the decisive re-check did not pass (mismatched {d['mismatched'][:10]}, over the wall "
-                   f"{d['over_wall'][:10]}, no verdict {d['infra'][:10]})")
-    if st == "disqualified" and (d["passed"] or not (d["mismatched"] or d["over_wall"])):
-        bad.append("disqualified at the decisive re-check, but every decisive scene gave phase 1's action hash "
-                   "within wall_s")
+    score = (doc.get("phase1") or {}).get("score") or 0
+    if is_legacy(doc):
+        best = dec.get("king_best")
+        return best is None or above(score, best, doc.get("margin"))
+    return dec.get("bar") is None or frac(score) > frac(dec["bar"])
+
+
+def decision_check(doc: dict) -> dict | None:
+    dec = doc.get("decision") if isinstance(doc.get("decision"), dict) else None
+    if dec is None or is_legacy(doc):
+        return None
+    sid, new = (doc.get("submission") or {}).get("id"), dec.get("new") or []
+    return {"round": dec.get("round"), "bar": dec.get("bar"), "rank_at": dec.get("rank_at"), "new": len(new),
+            "entered": sid in new, "above_bar": eligible(doc)}
+
+
+def _decision_problems(doc: dict, st: str, p2: dict | None) -> list[str]:
+    sub, dec, bad = doc["submission"], doc.get("decision") or {}, []
+    if not dec:
+        return [f"{st}, but the document has no decision"] if st in ("ranked", "not_ranked") else []
+    new, at, sid = dec.get("new") or [], dec.get("rank_at"), sub.get("id")
+    if dec.get("round") is not None and sub.get("round") is not None and dec["round"] != sub["round"]:
+        bad.append(f"decision.round {dec['round']} is not the submission's round {sub['round']}")
+    if len(set(new)) != len(new):
+        bad.append("decision.new repeats a submission")
+    if st == "ranked":
+        if sid not in new:
+            bad.append(f"ranked, but decision.new does not name {sid}")
+        if at is None:
+            bad.append("ranked, but decision.rank_at is null")
+        elif at > len(new):
+            bad.append(f"rank_at {at}, but only {len(new)} submissions entered (the new ones take ranks 1..{len(new)})")
+        if not eligible(doc):
+            bad.append(f"ranked, but the phase-1 score {doc['phase1'].get('score')} is not above the bar {dec.get('bar')}")
+    else:
+        if at is not None:
+            bad.append(f"{st}, but decision.rank_at is {at}")
+        if sid in new:
+            bad.append(f"{st}, but decision.new names this submission")
+    if st == "not_ranked" and eligible(doc) and p2 is not None and p2["passed"] and len(new) < RANKS:
+        bad.append(f"not_ranked, but its score is above the bar {dec.get('bar')} and only {len(new)} submissions "
+                   f"entered at round {dec.get('round')}'s decision (up to {RANKS} do)")
     return bad
 
 
@@ -488,24 +384,28 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
         bad += _score("phase 1", p1, count)
     margin = float(doc.get("margin") or 0.0)
     dec = doc.get("decision") or {}
-    best = dec.get("king_best")
+    legacy = is_legacy(doc)
     score = float(p1.get("score") or 0.0)
+    bar = dec.get("king_best") if legacy else dec.get("bar")
+    above_bar = eligible(doc)
+    what = (f"the king's best {bar} + margin {margin}" if legacy else f"the bar {bar}")
     p2 = phase2_check(doc)
-    king = doc.get("king") or None
-    eligible = best is None or above(score, best, margin)
-    if bool(dec.get("phase2_ran")) != (p2 is not None):
+    if legacy:
+        warnings.append("a document from before v10: its king run and decisive re-check (if any) are not checked; "
+                        "v10 has none (phase 1, phase 2 and the bar are checked)")
+    if dec.get("phase2_ran") is not None and bool(dec["phase2_ran"]) != (p2 is not None):
         bad.append("decision.phase2_ran disagrees with the phase2 section")
     if st == "below_king":
-        if eligible:
-            bad.append(f"below_king, but the phase-1 score {score} is above the king's best {best} + margin {margin}")
-        if p2 is not None or king is not None:
-            bad.append("below_king, but phase 2 or a king run is published")
+        if above_bar:
+            bad.append(f"below_king, but the phase-1 score {score} is above {what}"
+                       + ("" if bar is not None else " (no king: every score counts)"))
+        if p2 is not None:
+            bad.append("below_king, but phase 2 is published")
     elif ours and p2 is None:
-        if king is not None:
-            bad.append(f"{st} ({sub.get('reason')}), but a king run is published")
+        pass
     elif st in FINAL:
-        if not eligible:
-            bad.append(f"phase 2 ran, but the phase-1 score {score} is not above the king's best {best} + margin {margin}")
+        if not above_bar:
+            bad.append(f"phase 2 ran, but the phase-1 score {score} is not above {what}")
         if p2 is None:
             bad.append(f"{st}, but no phase 2 is published")
         else:
@@ -521,51 +421,36 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
                 if have is not None and sorted(have) != sorted(mine):
                     bad.append(f"phase2.{f} {sorted(have)[:10]} is not {sorted(mine)[:10]}, the recomputed list "
                                f"(infrastructure failures left out: {p2['infra'][:10]})")
-            if st == "disqualified" and p2["passed"] and king is None and not ours:
+            at_decisive = legacy and doc.get("decisive") is not None
+            if st == "disqualified" and p2["passed"] and not ours and not at_decisive:
                 bad.append("disqualified, but every phase-2 action hash equals phase 1's and every scene fits wall_s")
             if st == "disqualified" and not (doc["phase2"].get("reason") or sub.get("reason")):
                 bad.append("disqualified without a reason")
-            if st in ("crowned", "not_crowned") and not p2["passed"]:
+            if st in ("ranked", "not_ranked", "crowned", "not_crowned") and not p2["passed"]:
                 bad.append(f"{st}, but phase 2 did not pass (mismatched {p2['mismatched'][:10]}, "
                            f"over the wall {p2['over_wall'][:10]}, compared {p2['compared']})")
-        if st == "disqualified" and king is not None and doc.get("decisive") is None and not ours:
-            bad.append("disqualified, but a king run is published")
-        if st == "disqualified" and king is not None and doc.get("decisive") is not None and not ours:
-            if p2 is not None and not p2["passed"]:
-                bad.append("disqualified with a decisive re-check, but phase 2 did not pass")
-            bad += _king(king, count, dec, warnings) + _decision(doc, st, margin) + _decisive_problems(doc, st)
-        if st in ("crowned", "not_crowned"):
-            no_king = king is None and dec.get("king") is None and dec.get("king_score") is None
-            if king is None and not no_king:
-                bad.append(f"{st}, but no king run on the same scenes is published")
-            else:
-                if king is not None:
-                    bad += _king(king, count, dec, warnings)
-                bad += _decision(doc, st, margin) + _decisive_problems(doc, st)
-    if bool(dec.get("crowned")) != (st == "crowned"):
+    if not legacy:
+        bad += _decision_problems(doc, st, p2)
+    if dec.get("crowned") is not None and bool(dec["crowned"]) != (st == "crowned"):
         bad.append("decision.crowned disagrees with the status")
     return bad
 
 
 def pick(doc: dict, ref: str | None) -> tuple[str, dict]:
-    sub, king = doc["submission"], doc.get("king") or None
+    sub = doc["submission"]
     if not ref:
         return "submission", sub
     ref = ref.strip()
-    for role, who in (("submission", sub), ("king", king)):
-        if who is None:
-            continue
-        keys = {who.get("image"), who.get("digest"), who.get("hotkey"), who.get("id"), role}
-        if ref in keys or (who.get("digest") and ref.endswith("@" + who["digest"])):
-            return role, who
-    have = ", ".join(x.get("image") or "no image published" for x in (sub, king) if x) or "none"
-    raise VerifyError(f"{ref} did not run for submission {sub.get('id')} (ran: {have})")
+    keys = {sub.get("image"), sub.get("digest"), sub.get("hotkey"), sub.get("id"), "submission"}
+    if ref in keys or (sub.get("digest") and ref.endswith("@" + sub["digest"])):
+        return "submission", sub
+    raise VerifyError(f"{ref} is not submission {sub.get('id')}'s image ({sub.get('image') or 'no image published'}); "
+                      "only the submission's own image can be re-run (v10 has no king run)")
 
 
 def rerun(doc: dict, role: str, expert: dict, scenes: dict, e, *, wall_s: float | None = None, workers: int = 1,
           docker: dict | None = None, log=rv._log) -> dict:
-    part = doc["phase1"] if role == "submission" else doc["king"]
-    res = part["results"]
+    res = doc["phase1"]["results"]
     pos = {x["index"]: k for k, x in enumerate(doc["scenes"])}
     limit = (doc.get("task") or {}).get("time_limit_s")
     if limit is None:
@@ -597,7 +482,7 @@ def rerun(doc: dict, role: str, expert: dict, scenes: dict, e, *, wall_s: float 
         if not eq:
             rows.append({"index": i, "published": pub, "local": loc, "infra": bool(r.get("infra"))})
     k = max(1, len(idxs))
-    return {"role": role, "image": (doc["submission"] if role == "submission" else doc["king"]).get("image"),
+    return {"role": role, "image": doc["submission"].get("image"),
             "ran": expert.get("image") or "command", "scenes": len(idxs), "hash_equal": same_hash,
             "hash_agreement": round(same_hash / k, 4), "outcome_agreement": round(same_out / k, 4),
             "local_successes": sum(1 for r in got if r.get("success")), "local_infra": infra, "mismatched": rows}
@@ -620,9 +505,7 @@ def verify(doc: dict, *, e=None, hash_scenes: int | None = None, image: str | No
         out["ok"] = False
         return out
     out["phase2"] = phase2_check(doc)
-    out["decisive"] = decisive_check(doc)
-    same = same_scenes(doc) if out["status"] in ("crowned", "not_crowned") or doc.get("decisive") else None
-    out["same_scenes"] = {k: v for k, v in same.items() if k != "pairs"} if same else None
+    out["decision"] = decision_check(doc)
     role, who = pick(doc, image) if image or expert else ("submission", None)
     skip_rerun = None
     if who is not None and expert is None:
@@ -649,7 +532,7 @@ def verify(doc: dict, *, e=None, hash_scenes: int | None = None, image: str | No
     order = [idx[j] for j in rv.sample_order(count, sample_seed)]
     pick_idx = []
     if who is not None:
-        res, pos = who.get("results") or doc["phase1"]["results"], {x["index"]: k for k, x in enumerate(doc["scenes"])}
+        res, pos = doc["phase1"]["results"], {x["index"]: k for k, x in enumerate(doc["scenes"])}
         n = min(len(res.get(k) or []) for k in ("success", "outcome", "action_hash"))
         ran = [i for i in order if pos[i] < n and res["action_hash"][pos[i]] is not None and _verdict(res, pos[i])
                and res["outcome"][pos[i]] not in CUT_OFF]

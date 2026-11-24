@@ -149,7 +149,7 @@ def cmd_status(a) -> int:
     print(json.dumps(out, indent=1))
     for s in out["submissions"]:
         print(f"vector-miner: {s['id']}: {s['verdict']}", file=sys.stderr)
-    for k in ("king_note", "note"):
+    for k in ("ranks_note", "note"):
         if out.get(k):
             print(f"vector-miner: {out[k]}", file=sys.stderr)
     return 0
@@ -414,7 +414,7 @@ def main(argv=None) -> int:
     c.add_argument("--no-api-check", action="store_true", help="do not ask the API whether this hotkey already has a submission")
     c.add_argument("--dev-api", help="a local dev API (no chain): commit there instead")
     s = sub.add_parser("status", parents=[common], help="your submission: phase-1 progress, queue position, phase 2, "
-                                                        "the king on the same scenes, the verdict")
+                                                        "its rank after the round decision, the verdict")
     s.add_argument("--api", default=api_default, required=not api_default)
     s.add_argument("--hotkey", help="an ss58 address instead of the wallet's hotkey")
     sv = sub.add_parser("serve", parents=[common], help="phase 1: connect to the subnet and run your committed image "
@@ -457,13 +457,13 @@ def main(argv=None) -> int:
                    "(phase 1: 2)")
     e.add_argument("--strict", action="store_true", help="exit 1 when a scene missed a phase-1 deadline")
     v = sub.add_parser("verify", help="re-check a final submission: regenerate its scenes from the published salt, "
-                                      "check phase 1, phase 2 and the king run, optionally re-run an image")
+                                      "check phase 1, phase 2 and the round decision, optionally re-run the image")
     v.add_argument("--submission", help="the submission id")
     v.add_argument("--api", default=os.environ.get("VECTOR_MINER_API"))
     v.add_argument("--doc", help="read a saved verify document instead of fetching it")
     v.add_argument("--save", help="write the fetched document here")
-    v.add_argument("--image", help="re-run this image ('submission', 'king', or its reference, digest or hotkey) "
-                                   "on --scenes scenes")
+    v.add_argument("--image", help="re-run the submission's image ('submission', or its reference, digest or "
+                                   "hotkey) on --scenes scenes")
     v.add_argument("--command", help="with --image: run a local program in its place (no docker)")
     v.add_argument("--scenes", type=int, default=20, help="scenes to re-run the image on (sampled)")
     v.add_argument("--hash-scenes", type=int, help="regenerate only this many sampled scenes (default: all)")
