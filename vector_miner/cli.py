@@ -438,15 +438,48 @@ def _verify(a) -> int:
     why = _verify_args(a)
     if why:
         return bad(why)
-    if a.submission is None:
+    if a.submission is None and (a.image or "").strip() != "king":
         return bad("give --submission ID")
     return _verify_submission(a, bad)
+
+
+def _king_image(a, bad) -> tuple[str | None, int | None]:
+    """--image king: the king's public image (king.public_image) and its submission, from the board."""
+    if not a.api:
+        return None, bad("--image king reads the king's public image from --api (or VECTOR_MINER_API)")
+    import httpx
+
+    from .api import Api, ApiError
+    try:
+        ex = Api(a.api).expert()
+    except ApiError as e:
+        return None, bad(str(e))
+    except httpx.HTTPError as e:
+        return None, bad(f"cannot reach {a.api}: {e}")
+    king = ex.get("king") if isinstance(ex.get("king"), dict) else None
+    if not king or not king.get("submission"):
+        return None, bad("there is no king yet: --image king needs a decided round")
+    ref = king.get("public_image")
+    if not isinstance(ref, str) or not ref.strip():
+        return None, bad("the king's public image is not published yet (king.public_image is empty); "
+                         "it is published once the round's decision is final")
+    if a.submission is None:
+        a.submission = str(king["submission"])
+    elif a.submission != str(king["submission"]):
+        return None, bad(f"--image king re-runs the king's public image on the king's submission "
+                         f"({king['submission']}), not on {a.submission}")
+    return ref.strip(), None
 
 
 def _verify_submission(a, bad) -> int:
     from . import subverify as sv
     from . import verify as vf
     salt_expect, salt_source = a.salt_sha256, "you gave"
+    king_image = None
+    if (a.image or "").strip() == "king":
+        king_image, code = _king_image(a, bad)
+        if code is not None:
+            return code
     sid = a.submission
     try:
         if a.doc:
@@ -491,8 +524,8 @@ def _verify_submission(a, bad) -> int:
             except ValueError as e:
                 return bad(f"--command: {e}")
         docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
-        out = sv.verify(doc, hash_scenes=a.hash_scenes, image=a.image, expert=expert, rerun_scenes=a.scenes,
-                        sample_seed=a.sample_seed, wall_s=a.wall, workers=a.workers, docker=docker,
+        out = sv.verify(doc, hash_scenes=a.hash_scenes, image=a.image, king_image=king_image, expert=expert,
+                        rerun_scenes=a.scenes, sample_seed=a.sample_seed, wall_s=a.wall, workers=a.workers, docker=docker,
                         salt_sha256=salt_expect, salt_source=salt_source, pull=a.pull,
                         allow_uncommitted=a.allow_uncommitted)
     except vf.VerifyError as e:
@@ -583,12 +616,13 @@ def main(argv=None) -> int:
     e.add_argument("--strict", action="store_true", help="exit 1 when a scene missed a phase-1 deadline")
     v = sub.add_parser("verify", help="re-check a final submission: regenerate its scenes from the published salt, "
                                       "check phase 1, phase 2 and the round decision, optionally re-run the image")
-    v.add_argument("--submission", help="the submission id")
+    v.add_argument("--submission", help="the submission id (with --image king: the king's, by default)")
     v.add_argument("--api", default=os.environ.get("VECTOR_MINER_API"))
     v.add_argument("--doc", help="read a saved verify document instead of fetching it")
     v.add_argument("--save", help="write the fetched document here")
-    v.add_argument("--image", help="re-run the submission's image ('submission', or its reference, digest or "
-                                   "hotkey) on --scenes scenes")
+    v.add_argument("--image", help="re-run an image on --scenes scenes: 'king' (the king's public image, "
+                                   "king.public_image, on the king's submission) or 'submission' (its committed "
+                                   "image; also its reference, digest or hotkey)")
     v.add_argument("--command", help="with --image: run a local program in its place (no docker)")
     v.add_argument("--scenes", type=int, default=20, help="scenes to re-run the image on (sampled)")
     v.add_argument("--hash-scenes", type=int, help="regenerate only this many sampled scenes (default: all)")

@@ -16,9 +16,9 @@ flowchart LR
   F --> SV["vector-miner serve: your machine plays your fresh scenes, 1,000 by default (phase 1)"]
   SV --> SC["phase-1 score"]
   SC -->|"not above the bar (the king's score + margin)"| BK["below_king (final)"]
-  SC -->|"above"| RE["waits for the end of its round (the round its phase 1 ended in)"]
-  RE --> Q["the round's evaluation: in commit order, one at a time"]
-  Q --> CP["the subnet copies your image into its registry"]
+  SC -->|"above"| RE["the subnet copies your image into its private registry, and the submission waits for the end of its round (the round its phase 1 ended in)"]
+  RE --> Q["the round's evaluation: highest phase-1 score first, one at a time"]
+  Q --> CP["the subnet copies your image into its private registry, if that has not happened yet"]
   CP -->|"the image is gone (deleted, or private and not shared)"| DQ["disqualified"]
   CP --> P2["phase 2: the copy runs in docker on 100 of the scenes (by default)"]
   P2 -->|"an action hash differs, or a scene is over the wall"| DQ
@@ -26,6 +26,7 @@ flowchart LR
   PS --> RD{"round decision: the round's best three above the bar"}
   RD -->|"in"| RK["ranked: rank 1 (the king) 70 %, rank 2 20 %, rank 3 10 % of the expert part"]
   RD -->|"out"| NR["not_ranked"]
+  RK --> KP["rank 1: its image is published at ghcr.io/robotensor/vector-king"]
   RK --> V["vector-miner verify --submission ID"]
   NR --> V
   DQ --> V
@@ -44,11 +45,12 @@ ends. Phase 1 alone ranks the scripts: the bar is the king's phase-1 score + `ma
 higher than the king's, and before the first round decision there is no king and no bar. Any score must be above
 `expert.min_score` (0: at least one scene solved) to rank. A
 phase-1 score not above the bar is `below_king` at once; the others wait until their round ends, and then that
-round's evaluation runs while the next round already runs: in commit order (older round first, then the earlier
-commit block), one submission at a time, each checked against the bar again when its turn comes. The subnet keeps
-your phase-1 scenes and results for this. When your submission's turn comes, the subnet first copies your committed
-image into its own registry (until then keep the image public, or private and shared with the subnet's team account
-with Read access: an image the subnet cannot pull then is `disqualified`, "image no longer available"); everything
+round's evaluation runs while the next round already runs: by phase-1 score, highest first (an older round before a
+later one), one submission at a time, each checked against the bar again when its turn comes. The subnet keeps
+your phase-1 scenes and results for this. As soon as your phase 1 is scored above the bar, the subnet copies your committed
+image into its own private registry (until then keep the image public, or private and shared with the subnet's team account
+with Read access; a copy that could not be made is tried again when your submission's turn comes, and an image the
+subnet cannot pull then is `disqualified`, "image no longer available"); everything
 after that runs the copy. Phase 2 re-runs it on our side (docker, `--network none`) on 100 of those scenes (its
 `phase2_scenes`): every
 action hash must equal phase 1's, or the submission is disqualified. A submission that passes phase 2 is `passed`.
@@ -62,6 +64,18 @@ one pushes the lowest old rank out. They are `ranked`; the round's other `passed
 ranked submission pushed out later keeps `ranked` with `ranked_out_round`. Example: ranks 0.10, 0.50, 0.70 (rank 3,
 2, 1) and a round bringing 0.70, 0.72 and 0.74: 0.70 is not higher than the king, so 0.72 and 0.74 enter and the
 ranks become 0.70 (rank 3), 0.72 (rank 2), 0.74 (rank 1, the new king). An empty rank's part is burned.
+
+The subnet's copies of submitted images are private: nobody outside the subnet's team can pull them. Only the king
+is public: once a round's evaluation is over and its decision is final, the king's image (rank 1, paid until the next
+decision) is published at `ghcr.io/robotensor/vector-king`, which holds that one image, tagged `king` and
+`round-<n>`. `GET /v1/skills/bin-picking/expert` gives its digest reference as `king.public_image` (null until it is
+published). Pull it to inspect the king, run it, compare with it or build your own image on top of it; committing it
+as it is, or its layers under another digest, is a `copy` and is refused.
+
+```bash
+docker pull ghcr.io/robotensor/vector-king:king
+.venv/bin/vector-miner eval --image ghcr.io/robotensor/vector-king:king --pull --scenes 1000 --seed 7
+```
 
 ## Setup
 
@@ -300,11 +314,11 @@ flowchart TD
 ```
 
 One JSON object: `king` (whether you are the king, rank 1), `rank` (your hotkey's rank now, or null),
-`king_hotkey`, `king_image`, `king_score` (its phase-1 score), `bar` (the king's score + margin; null before the first
+`king_hotkey`, `king_image` (the king's public image, `king.public_image`; null until it is published), `king_score` (its phase-1 score), `bar` (the king's score + margin; null before the first
 round decision, when `ranks_note` says so), `margin`, `ranks` (`[{rank, share, hotkey, score, round}]`, rank 1
 first), and `submissions`, each with `id`, `image`, `status`, `committed_at`, `salt_sha256`,
 `phase1 {done, total, score, successes}`, `round` (the round its phase 1 ended in), `evaluates_at` (when that round
-ends, while it is ahead), `queue_position` (evaluation order: commit order, older round first), `phase2`, `stage`,
+ends, while it is ahead), `queue_position` (evaluation order: older round first, then highest phase-1 score first), `phase2`, `stage`,
 `rank` (its place in the ranks now), `rank_at` (the rank it entered with), `ranked_out_round`, `reason`, `retry_at`,
 `final` and `verdict` (one line, also printed to stderr).
 It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/expert/submissions?hotkey=<ss58>`.
@@ -315,7 +329,7 @@ It reads `GET /v1/skills/bin-picking/expert` and `GET /v1/skills/bin-picking/exp
 | `phase1` | `serve` is playing your scenes: `phase1.done` of `phase1.total`. After the first hour on the socket it must keep up 200 scenes an hour on average (8 at once do ≥ 640), or the rest count as failures and the slot goes to the next miner |
 | `scored` | phase 1 is done and above the bar: waits for its round to end (`evaluates_at`), then for its turn in the evaluation (`queue_position`) |
 | `below_king` | phase 1 is not above the bar (the king's score + margin); final. A queued submission is checked against the bar again when its turn comes (the bar only rises) |
-| `phase2` | `stage` `copy`: we copy your image into our registry; then we run the copy in docker on 100 (by default) of your scenes and compare action hashes |
+| `phase2` | `stage` `copy`: we copy your image into our private registry, if that has not happened yet; then we run the copy in docker on 100 (by default) of your scenes and compare action hashes |
 | `passed` | phase 2 passed; decided when its round is (every submission of the round final or `passed`) |
 | `ranked` | in the ranks after its round's decision: "rank k · 70%" (20 %, 10 %) while it holds one, "ranked out in round m" after; final |
 | `not_ranked` | phase 2 passed but not in the ranks: not above the bar, or not in its round's top three; final |
@@ -408,7 +422,8 @@ decision), the API publishes everything needed to check it at
 vector-env version and asset sha256 the scenes were made with, every scene's seed and state hash, phase 1 (score and
 per-scene success, time, outcome, action hash), phase 2 (the scenes, their action hashes and wall times) and the
 decision `{round, bar, rank_at, new}` (the bar, the rank it entered with, the submission ids that entered at its
-round's decision); `submission.mirror_url` is the subnet's copy of the image. There is no king run to check.
+round's decision); `submission.mirror_url` names the subnet's private copy of the image, which only the team can
+pull. Checking the document and regenerating the scenes needs no image. There is no king run to check.
 
 ```mermaid
 flowchart LR
@@ -426,9 +441,11 @@ flowchart LR
 # check the document and regenerate all its scenes (1000 by default, about 2 s each; --hash-scenes 100 checks a sample)
 .venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai
 
-# also re-run the submission's image on 20 sampled scenes in docker and compare action hashes
-.venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai --hash-scenes 100 \
-  --image submission --scenes 20 --pull
+# the king: also re-run its public image on 20 sampled scenes in docker and compare action hashes
+.venv/bin/vector-miner verify --image king --api https://vector.robotensor.ai --hash-scenes 100 --scenes 20 --pull
+
+# re-run the image a submission committed (you can pull it if it is public or yours)
+.venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai --image submission --scenes 20 --pull
 
 # with the salt commitment you noted at commit time
 .venv/bin/vector-miner verify --submission <id> --api https://vector.robotensor.ai --salt-sha256 <64 hex>
@@ -464,8 +481,10 @@ flowchart LR
   score above the bar needs three others to have entered (`new` full). The other submissions' scores are not in the
   document, so the order within `new` is not recomputed.
   Images must be `ghcr.io/<repo>@sha256:<digest>` with their own `digest`.
-- `--image` takes `submission`, or the submission image's reference, digest or hotkey; it runs the image (or
-  `--command` instead) on `--scenes` scenes with a published verdict that is not a cut-off, sampled with `--sample-seed`, and reports
+- `--image` takes `king`: the king's public image (`king.public_image`, read from `--api`), on the king's submission
+  (the default `--submission`; another submission is refused, and so is a king without a public image yet); or
+  `submission`, or the submission image's reference, digest or hotkey: the image the submission committed. It runs
+  that image (or `--command` instead) on `--scenes` scenes with a published verdict that is not a cut-off, sampled with `--sample-seed`, and reports
   `hash_equal`, `hash_agreement`, `outcome_agreement` and every scene whose action hash differs. A deterministic
   image gives the published hashes on any machine. Re-run differences do not change the exit code.
 - `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched`, `over_wall`, `infra`,

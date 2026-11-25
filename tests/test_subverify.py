@@ -16,16 +16,19 @@ from vector_miner import cli, subverify, verify
 
 SUB = "ghcr.io/alice/bin-expert@sha256:" + "a" * 64
 KING = "ghcr.io/kate/bin-expert@sha256:" + "c" * 64
+PUBLIC = "ghcr.io/robotensor/vector-king@sha256:" + "e" * 64
 SID = "sub-42"
 
 
 class Harness:
     rates = {SUB: 0.8, KING: 0.4}
+    same = {PUBLIC: SUB}  # the king's public image is the same image as the one the submission committed
 
     def run(self, expert, scenes, *, time_limit_s, wall_s, workers=1, docker=None, on_result=None):
         out = []
         cmd = expert.get("command") or []
         ref = expert.get("image") or (cmd[cmd.index("as") + 1] if "as" in cmd else "x")
+        ref = self.same.get(ref, ref)
         for sc in scenes:
             ok = _h("scene", ref, sc["seed"]) < self.rates.get(ref, 0.0)
             tag = f"{ref}:{sc['seed']}" + (f":{random.random()}" if "noisy" in cmd else "")
@@ -280,9 +283,50 @@ def test_a_rerun_compares_action_hashes(capsys, env, tmp_path):
                          f"x noisy as {SUB}", "--scenes", "3")
     r = out["rerun"]
     assert code == 0 and r["hash_equal"] == 0 and len(r["mismatched"]) == 3 and r["outcome_agreement"] == 1.0, r
-    for ref in ("ghcr.io/eve/x@sha256:" + "f" * 64, "king"):
-        code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", ref)
-        assert code == 2 and f"is not submission {SID}'s image" in err and "no king run" in err, err
+    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", "ghcr.io/eve/x@sha256:" + "f" * 64)
+    assert code == 2 and f"is not submission {SID}'s image" in err and "'king'" in err, err
+    code, out, err = run(capsys, "--submission", SID, "--doc", p, "--image", "king")
+    assert code == 2 and "--image king reads the king's public image from --api" in err, err
+
+
+def board(monkeypatch, doc, king):
+    seen = []
+
+    def handler(req):
+        seen.append(req.url.path)
+        if req.url.path == "/v1/skills/bin-picking/expert":
+            return httpx.Response(200, json={"king": king, "ranks": []})
+        if req.url.path == f"/v1/skills/bin-picking/expert/submissions/{SID}/verify":
+            return httpx.Response(200, json=doc)
+        if req.url.path == f"/v1/skills/bin-picking/expert/submissions/{SID}":
+            return httpx.Response(200, json={"id": SID, "salt_sha256": doc["salt_sha256"]})
+        return httpx.Response(404, json={"detail": "not found"})
+    monkeypatch.setattr(api_mod, "make_client", lambda timeout: httpx.Client(transport=httpx.MockTransport(handler)))
+    return seen
+
+
+def test_image_king_reruns_the_kings_public_image(monkeypatch, capsys, env):
+    doc = make_doc(fake_env(broken=BROKEN))
+    seen = board(monkeypatch, doc, {"submission": SID, "hotkey": "5Alice", "public_image": PUBLIC})
+    code, out, err = run(capsys, "--api", "http://api", "--image", "king", "--scenes", "4", "--hash-scenes", "0")
+    r = out["rerun"]
+    assert code == 0 and out["submission"] == SID and r["role"] == "king" and r["ran"] == PUBLIC, out
+    assert r["scenes"] == 4 and r["hash_equal"] == 4 and r["mismatched"] == []
+    assert seen[0] == "/v1/skills/bin-picking/expert"
+    code, out, err = run(capsys, "--submission", "sub-9", "--api", "http://api", "--image", "king")
+    assert code == 2 and f"on the king's submission ({SID}), not on sub-9" in err, err
+
+
+@pytest.mark.parametrize("king, why", [
+    (None, "there is no king yet"),
+    ({"submission": SID, "public_image": None}, "the king's public image is not published yet"),
+    ({"submission": SID}, "the king's public image is not published yet"),
+    ({"submission": SID, "public_image": "ghcr.io/robotensor/vector-king:king"}, "is not a pinned image"),
+])
+def test_image_king_without_a_public_image(monkeypatch, capsys, env, king, why):
+    board(monkeypatch, make_doc(fake_env(broken=BROKEN)), king)
+    code, out, err = run(capsys, "--api", "http://api", "--image", "king", "--hash-scenes", "0")
+    assert code == 2 and why in err, err
 
 
 def _t(doc, fn):

@@ -215,7 +215,9 @@ def test_status_shows_progress_queue_phase2_rank_and_verdict(monkeypatch, capsys
     assert out["king"] is False and out["bar"] is None and out["ranks"] == [] and out["rank"] is None
     assert "no ranks yet" in out["ranks_note"] and "vector-miner: no ranks yet" in cap.err
     assert "no king yet, so no bar" in s["verdict"]
-    king = {"submission": "sub-1", "hotkey": "5King", "image": REF, "score": 0.64, "since_round": 2}
+    pub = "ghcr.io/robotensor/vector-king@sha256:" + "e" * 64
+    king = {"submission": "sub-1", "hotkey": "5King", "image": REF, "score": 0.64, "since_round": 2,
+            "public_image": pub}
     ex.update(king=king, bar=0.64, ranks=[{"rank": 1, "share": 0.7, "hotkey": "5King", "score": 0.64, "round": 2},
                                           {"rank": 2, "share": 0.2, "hotkey": "5Two", "score": 0.5, "round": 2}],
               decisions=[{"round": 3, "bar": 0.66, "new": ["sub-9"], "ranks": []}])
@@ -280,7 +282,10 @@ def test_status_shows_progress_queue_phase2_rank_and_verdict(monkeypatch, capsys
     rows[HOT] = []
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["king_image"] == REF and out["rank"] == 1
+    assert out["king_image"] == pub and out["rank"] == 1
+    del king["public_image"]
+    assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
+    assert json.loads(capsys.readouterr().out)["king_image"] is None
     assert out["king"] is True and out["submissions"] == [] and "vector-miner commit" in out["note"]
 
 

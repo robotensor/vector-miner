@@ -130,7 +130,7 @@ def status(api, hotkey: str) -> dict:
     subs = [view(s, ex) for s in api.submissions(hotkey)]
     mine = [r.get("rank") for r in ranks if r.get("hotkey") == hotkey]
     out = {"hotkey": hotkey, "king": bool(king) and king.get("hotkey") == hotkey, "rank": mine[0] if mine else None,
-           "king_hotkey": king.get("hotkey"), "king_image": king.get("image"), "king_score": _num(king.get("score")),
+           "king_hotkey": king.get("hotkey"), "king_image": king.get("public_image"), "king_score": _num(king.get("score")),
            "bar": _num(ex.get("bar")), "margin": _num(ex.get("margin")),
            "fee": ex.get("fee") if isinstance(ex.get("fee"), dict) else None,
            "ranks": [{k: r.get(k) for k in ("rank", "share", "hotkey", "score", "round")} for r in ranks],

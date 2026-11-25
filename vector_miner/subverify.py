@@ -436,16 +436,27 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
     return bad
 
 
-def pick(doc: dict, ref: str | None) -> tuple[str, dict]:
+def pick(doc: dict, ref: str | None, king_image: str | None = None) -> tuple[str, dict]:
+    """Which image to re-run: 'submission' (or its reference, digest or hotkey) is the image the submission
+    committed; 'king' is the king's public image (king.public_image), for the king's own submission."""
     sub = doc["submission"]
     if not ref:
         return "submission", sub
     ref = ref.strip()
+    if ref == "king":
+        if not king_image:
+            raise VerifyError("--image king needs the king's public image (king.public_image from --api)")
+        try:
+            digest = parse_image(king_image)["digest"]
+        except BadImage as e:
+            raise VerifyError(f"the king's public image {king_image!r} is not a pinned image ({e})") from None
+        return "king", {"image": king_image, "digest": digest}
     keys = {sub.get("image"), sub.get("digest"), sub.get("hotkey"), sub.get("id"), "submission"}
     if ref in keys or (sub.get("digest") and ref.endswith("@" + sub["digest"])):
         return "submission", sub
     raise VerifyError(f"{ref} is not submission {sub.get('id')}'s image ({sub.get('image') or 'no image published'}); "
-                      "only the submission's own image can be re-run (there is no king run)")
+                      "--image takes 'submission' (its committed image) or 'king' (the king's public image, "
+                      "for the king's submission)")
 
 
 def rerun(doc: dict, role: str, expert: dict, scenes: dict, e, *, wall_s: float | None = None, workers: int = 1,
@@ -489,7 +500,7 @@ def rerun(doc: dict, role: str, expert: dict, scenes: dict, e, *, wall_s: float 
 
 
 def verify(doc: dict, *, e=None, hash_scenes: int | None = None, image: str | None = None,
-           expert: dict | None = None, rerun_scenes: int = 20, sample_seed: int = 0, wall_s: float | None = None,
+           king_image: str | None = None, expert: dict | None = None, rerun_scenes: int = 20, sample_seed: int = 0, wall_s: float | None = None,
            workers: int = 1, docker: dict | None = None, salt_sha256: str | None = None,
            salt_source: str = "you gave", pull: bool = False, allow_uncommitted: bool = False, log=rv._log) -> dict:
     warnings: list[str] = []
@@ -506,7 +517,7 @@ def verify(doc: dict, *, e=None, hash_scenes: int | None = None, image: str | No
         return out
     out["phase2"] = phase2_check(doc)
     out["decision"] = decision_check(doc)
-    role, who = pick(doc, image) if image or expert else ("submission", None)
+    role, who = pick(doc, image, king_image) if image or expert else ("submission", None)
     skip_rerun = None
     if who is not None and expert is None:
         skip_rerun = pin_problem(who)
