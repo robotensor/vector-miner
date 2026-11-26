@@ -292,7 +292,13 @@ flowchart TD
   `true` or a larger value ends that scene as `expert_error`, your failure.
 - When the connection drops, the running scenes' containers are killed and `serve` reconnects with backoff
   (1 s doubling to 60 s, times 0.5 to 1); the subnet restarts the unfinished scenes from tick 0, at most twice per
-  scene. Keep `serve` running until it prints `done`.
+  scene. Keep `serve` running until it prints `done`, ideally under a process manager (systemd, tmux or pm2) so it
+  starts again if it stops.
+- Phase-1 slots: the subnet runs 2 submissions at once. A free slot goes to the earliest commit among the miners that
+  tried to connect in the last 150 s; the others get `4429 busy`. A reconnect within 60 s keeps the same slot. A
+  submission takes at most 3 slots, and the third waits behind every other miner; when it ends with phase 1
+  unfinished, the scenes not played count as failed. A slot the subnet ended (a server restart) is not counted.
+  `phase1.slots` in `vector-miner status` and the submissions list shows the slots used.
 - `{"type":"welcome"}` (submission, status, `done`/`scenes`, the deadlines) and `{"type":"error"}` without a
   `scene_key` (its `reason` and `message`) are printed. `{"type":"done"}` (phase 1 finished: status, score,
   successes/scenes) ends `serve` with exit 0; when its status is `review` with a `retry_at` (scenes failed on the

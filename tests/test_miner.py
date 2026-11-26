@@ -683,3 +683,10 @@ def test_the_unpaid_verdict():
     v = board.verdict({"status": "unpaid", "reason": "No fee payment of 0.1 TAO"}, {})
     assert v.startswith("unpaid: No fee payment") and "vector-miner fee pay" in v and "commit again" in v
     assert board.existing([{"status": "unpaid", "commit_block": 1}]) is None
+
+
+def test_status_shows_the_phase1_slot():
+    from vector_miner import board
+    row = {"status": "phase1", "phase1": {"done": 40, "total": 1000, "slots": 2, "slots_max": 3}}
+    assert "40/1000 scenes" in board.verdict(row, {}) and "slot 2 of 3" in board.verdict(row, {})
+    assert "slot" not in board.verdict({"status": "phase1", "phase1": {"done": 40, "total": 1000}}, {})

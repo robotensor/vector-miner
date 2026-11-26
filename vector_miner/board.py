@@ -20,8 +20,12 @@ def _f3(v) -> str:
 
 def phase1(s: dict) -> dict:
     p = s.get("phase1") if isinstance(s.get("phase1"), dict) else {}
-    return {"done": _num(p.get("done")), "total": _num(p.get("total")), "score": _num(p.get("score", s.get("score"))),
-            "successes": _num(p.get("successes"))}
+    out = {"done": _num(p.get("done")), "total": _num(p.get("total")), "score": _num(p.get("score", s.get("score"))),
+           "successes": _num(p.get("successes"))}
+    for k in ("slots", "slots_max"):
+        if _num(p.get(k)) is not None:
+            out[k] = _num(p.get(k))
+    return out
 
 
 def _share(rank, shares) -> str:
@@ -44,7 +48,9 @@ def verdict(s: dict, ex: dict) -> str:
         return ("waiting for your miner: run vector-miner serve --image <your image> so phase 1 can start "
                 "(abandoned after 48 h without a connection)")
     if st == "phase1":
-        return f"phase 1: {p1['done'] or 0}/{p1['total'] or 1000} scenes played against your miner; keep serve running"
+        slot = f"; slot {p1['slots']:g} of {p1['slots_max']:g}" if p1.get("slots") and p1.get("slots_max") else ""
+        return (f"phase 1: {p1['done'] or 0}/{p1['total'] or 1000} scenes played against your miner{slot}; "
+                "keep serve running")
     if st == "scored":
         q, at = s.get("queue_position"), s.get("evaluates_at")
         line = f"phase 1 done: {_pct(p1['score'])}"
