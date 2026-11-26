@@ -92,6 +92,8 @@ Leaf API paths live in the leaf (its `api.py`). `protocol.py` and `chain.py` kee
 
 ## 5. Old module paths
 
+The old paths of this section are temporary. They stay through round `bin-picking-expert-r2` and are removed in the first change after that tag.
+
 `vector_miner.board`, `.local`, `.serve`, `.subverify` and `.verify` stay, each the same module object as
 `vector_miner.skills.bin_picking.expert.<same name>`. Each is a module that imports the new one and replaces itself
 in `sys.modules`:
