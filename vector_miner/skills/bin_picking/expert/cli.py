@@ -1,0 +1,650 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+
+from vector_miner import wallet
+from vector_miner.protocol import BadImage, parse_image
+
+from . import ID
+
+
+DEFAULT_WALLETS = wallet.DEFAULT_WALLETS
+btcli_create = wallet.btcli_create
+_keypair = wallet.keypair
+_wallet_flags = wallet.wallet_flags
+_coldkey_address = wallet.coldkey_address
+
+
+def _api_or_exit(a, what: str) -> str:
+    api = getattr(a, "api", None) or getattr(a, "dev_api", None)
+    if not api:
+        raise SystemExit(f"vector-miner: --api (or VECTOR_MINER_API) is required: {what}")
+    return api
+
+
+def check_no_submission(api: str, hotkey: str) -> None:
+    import httpx
+
+    from vector_miner.api import ApiError
+
+    from . import board
+    from .api import ExpertApi
+    try:
+        rows = ExpertApi(api).submissions(hotkey)
+    except ApiError as e:
+        raise SystemExit(f"vector-miner: cannot check this hotkey's submissions at {api}: {e} "
+                         "(--no-api-check commits without the check)") from None
+    except httpx.HTTPError as e:
+        raise SystemExit(f"vector-miner: cannot reach {api} to check this hotkey's submissions: {e} "
+                         "(--no-api-check commits without the check)") from None
+    s = board.existing(rows)
+    if s is not None:
+        raise SystemExit(board.refusal(hotkey, s))
+
+
+def fee_of(api: str, hotkey: str, what: str = "check this hotkey's fee payment") -> dict | None:
+    """The fee view of the API for a hotkey ({fee, coldkey, paid, payments, scanned_to}); None when the API has no fee."""
+    import httpx
+
+    from vector_miner.api import ApiError
+
+    from .api import ExpertApi
+    try:
+        return ExpertApi(api).fee(hotkey)
+    except ApiError as e:
+        if e.status == 404:
+            return None
+        raise SystemExit(f"vector-miner: cannot {what} at {api}: {e} (--no-api-check commits without the check)") from None
+    except httpx.HTTPError as e:
+        raise SystemExit(f"vector-miner: cannot reach {api} to {what}: {e} (--no-api-check commits without the "
+                         "check)") from None
+
+
+def fee_needed(j: dict, api: str, wallet: str = "") -> str:
+    f = j["fee"]
+    who = j.get("coldkey") or "the coldkey that owns this hotkey"
+    return (f"vector-miner: no unused fee payment of {f['tao']:g} TAO from {who} to the vault {f['vault']}. Every "
+            "submission needs its own payment, made before the commit; a commitment without one is unpaid and never "
+            f"evaluated. Pay it with vector-miner fee pay --api {api}{wallet}, wait until vector-miner fee status "
+            f"--api {api}{wallet} shows it, then commit")
+
+
+def check_fee(api: str, hotkey: str, wallet: str = "") -> None:
+    j = fee_of(api, hotkey)
+    if j is None or not j.get("fee") or j.get("paid"):
+        return
+    raise SystemExit(fee_needed(j, api, wallet))
+
+
+def pull_account(api: str | None) -> str | None:
+    """The subnet's team account that must be able to pull a private image (`pull_account` of the expert view)."""
+    if not api:
+        return None
+    import httpx
+
+    from vector_miner.api import ApiError
+
+    from .api import ExpertApi
+    try:
+        got = ExpertApi(api, timeout=20.0).expert().get("pull_account")
+    except (ApiError, httpx.HTTPError, AttributeError):
+        return None
+    return got if isinstance(got, str) and got else None
+
+
+def leaf_status(api: str) -> str | None:
+    """`leaf.status` of the leaf view; None when the view or its `leaf` object cannot be read."""
+    import httpx
+
+    from vector_miner.api import ApiError
+
+    from .api import ExpertApi
+    try:
+        lf = ExpertApi(api, timeout=20.0).expert().get("leaf")
+    except (ApiError, httpx.HTTPError, AttributeError):
+        return None
+    st = lf.get("status") if isinstance(lf, dict) else None
+    return st if isinstance(st, str) and st else None
+
+
+def check_leaf(api: str) -> None:
+    st = leaf_status(api)
+    if st in ("finished", "archived"):
+        raise SystemExit(f"vector-miner: {ID} is {st}: it takes no commits (--no-api-check skips this check)")
+    if st in ("planned", "paused"):
+        print(f"vector-miner: warning: {ID} is {st}: the commit is picked up when its next round starts",
+              file=sys.stderr)
+
+
+def private_warning(ref: str, api: str | None) -> str:
+    from .api import BASE
+    team = pull_account(api)
+    who = team or f"the subnet's team account (`pull_account` in GET {BASE})"
+    how = f"Package settings -> Manage access -> add {team or 'that account'}, role Read"
+    return (f"vector-miner: warning: {ref} is private (anonymous pulls are refused; your docker login can pull it). "
+            f"The subnet pulls it as {who}: share the package with it (Read) before you commit, or the commit is "
+            f"invalid. On ghcr.io: the package's {how}.")
+
+
+def cmd_commit(a) -> int:
+    try:
+        ref = parse_image(a.image)["ref"]
+    except BadImage as e:
+        raise SystemExit(f"bad image reference: {e}") from None
+    if not a.dev_api and a.netuid is None:
+        raise SystemExit("--netuid is required")
+    if not a.no_check:
+        from vector_miner.chain import image_access
+        state, why = image_access(ref)
+        if state == "missing":
+            raise SystemExit(f"the image is not pullable: {why} (--no-check to commit anyway)")
+        if state == "private":
+            print(private_warning(ref, getattr(a, "api", None) or getattr(a, "dev_api", None)), file=sys.stderr)
+    kp = _keypair(a)
+    if not a.no_api_check:
+        api = _api_or_exit(a, "commit first checks that this hotkey has no submission "
+                              "(one per hotkey, ever; --no-api-check skips it)")
+        check_leaf(api)
+        check_no_submission(api, kp.ss58_address)
+        check_fee(api, kp.ss58_address, _wallet_flags(a))
+    if a.dev_api:
+        from .api import ExpertApi
+        r = ExpertApi(a.dev_api, kp).dev_commit(ref)
+        print(json.dumps(r))
+        _next_steps(ref, a.dev_api, _wallet_flags(a))
+        return 0
+    from vector_miner.chain import commit
+    r = commit(a.network, a.netuid, kp, ref)
+    print(json.dumps(r))
+    if r["ok"]:
+        _next_steps(ref, a.api, _wallet_flags(a))
+    return 0 if r["ok"] else 1
+
+
+def _next_steps(ref: str, api: str | None, flags: str = "") -> None:
+    where = f" --api {api}" if api else ""
+    print(f"vector-miner: committed. Phase 1 starts when your miner connects (within 48 h): "
+          f"vector-miner serve --image {ref}{where}{flags}; follow it with vector-miner status{where}{flags}",
+          file=sys.stderr)
+
+
+def cmd_status(a) -> int:
+    import httpx
+
+    from vector_miner.api import ApiError
+
+    from . import board
+    from .api import ExpertApi
+    hotkey = a.hotkey or _keypair(a, "pass --hotkey <ss58>, or ").ss58_address
+    try:
+        out = board.status(ExpertApi(a.api), hotkey)
+    except ApiError as e:
+        print(f"vector-miner: {a.api}: {e}", file=sys.stderr)
+        return 2
+    except httpx.HTTPError as e:
+        print(f"vector-miner: cannot reach {a.api}: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(out, indent=1))
+    note = board.leaf_note(out["leaf"])
+    if note:
+        print(f"vector-miner: {note}", file=sys.stderr)
+    for s in out["submissions"]:
+        print(f"vector-miner: {s['id']}: {s['verdict']}", file=sys.stderr)
+    for k in ("ranks_note", "note"):
+        if out.get(k):
+            print(f"vector-miner: {out[k]}", file=sys.stderr)
+    return 0
+
+
+def _fee_line(j: dict) -> str:
+    f = j.get("fee")
+    if not f:
+        return "no submission fee is in effect"
+    if j.get("paid"):
+        p = (j.get("payments") or [{}])[0]
+        return (f"paid: payment {p.get('id')} ({p.get('tao')} TAO) from {j.get('coldkey')} backs your next commitment; "
+                f"{len(j.get('payments') or [])} unused")
+    seen = f" (payments seen up to block {j['scanned_to']})" if j.get("scanned_to") is not None else ""
+    return (f"not paid: send {f['tao']:g} TAO from {j.get('coldkey') or 'the coldkey that owns this hotkey'} to the "
+            f"vault {f['vault']} before you commit (vector-miner fee pay){seen}")
+
+
+def cmd_fee(a) -> int:
+    api = _api_or_exit(a, "the fee and the vault come from the API")
+    hotkey = getattr(a, "hotkey", None) or _keypair(a, "pass --hotkey <ss58>, or ").ss58_address
+    j = fee_of(api, hotkey, "read the fee")
+    if j is None:
+        print(f"vector-miner: {api} has no submission fee", file=sys.stderr)
+        return 0
+    if a.fee_cmd == "status":
+        print(json.dumps(j, indent=1))
+        print(f"vector-miner: {_fee_line(j)}", file=sys.stderr)
+        return 0
+    f = j.get("fee")
+    if not f:
+        print("vector-miner: no submission fee is in effect: nothing to pay", file=sys.stderr)
+        return 0
+    if j.get("paid") and not a.again:
+        print(f"vector-miner: {_fee_line(j)} (--again pays one more)", file=sys.stderr)
+        return 0
+    cold = _coldkey_address(a)
+    owner = j.get("coldkey")
+    if owner and cold and owner != cold:
+        raise SystemExit(f"vector-miner: the hotkey {hotkey} is owned by the coldkey {owner}, not by this wallet's "
+                         f"coldkey {cold}: only a payment from {owner} counts. Pay from the wallet of that coldkey")
+    if not owner:
+        print(f"vector-miner: warning: the hotkey {hotkey} is not registered yet; only a payment from the coldkey "
+              "that owns it counts", file=sys.stderr)
+    payer = owner or cold or "this wallet's coldkey"
+    where = f"the dev API {a.dev_api}" if a.dev_api else f"network {a.network}"
+    print(f"vector-miner: pay {f['tao']:g} TAO from {payer} to the vault {f['vault']} on {where}. The transfer is "
+          "final; one payment backs one submission.", file=sys.stderr)
+    if not a.yes:
+        try:
+            ok = input("Pay? [y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:
+            ok = False
+        if not ok:
+            print("vector-miner: not paid", file=sys.stderr)
+            return 1
+    if a.dev_api:
+        from .api import ExpertApi
+        r = ExpertApi(a.dev_api, _keypair(a)).dev_fee_pay(float(f["tao"]))
+        print(json.dumps(r))
+        ok = True
+    else:
+        import bittensor as bt
+
+        from vector_miner.chain import pay_fee
+        r = pay_fee(a.network, bt.Wallet(a.wallet_name, a.wallet_hotkey, a.wallet_path), str(f["vault"]),
+                    float(f["tao"]))
+        print(json.dumps(r))
+        ok = bool(r.get("ok"))
+    if ok:
+        print(f"vector-miner: paid. Once vector-miner fee status --api {api}{_wallet_flags(a)} shows it, commit: "
+              f"vector-miner commit --image <image@sha256:...> --api {api}{_wallet_flags(a)}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def _bundle():
+    try:
+        from vector_env import assets
+    except ImportError:
+        return None
+    try:
+        return assets.find()
+    except Exception:
+        return None
+
+
+def cmd_serve(a) -> int:
+    from . import serve as sv
+    try:
+        ref = parse_image(a.image)["ref"]
+    except BadImage as e:
+        raise SystemExit(f"bad image reference: {e} (serve the image you committed)") from None
+    if a.concurrency < 1 or (a.warm is not None and a.warm < 0):
+        raise SystemExit("--concurrency must be at least 1 and --warm at least 0")
+    try:
+        api_url = sv.ws_url(_api_or_exit(a, "serve connects to the subnet's API"))
+    except sv.ServeError as e:
+        raise SystemExit(f"vector-miner: {e}") from None
+    docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
+    if a.command:
+        import shlex
+        try:
+            expert = {"command": shlex.split(a.command)}
+        except ValueError as e:
+            raise SystemExit(f"vector-miner: --command: {e}") from None
+    else:
+        try:
+            from vector_env import harness
+        except ImportError:
+            raise SystemExit("vector-miner serve --image needs vector-env (scripts/setup.sh installs it)") from None
+        try:
+            harness.ensure_image(ref, docker, pull_missing=a.pull)
+        except harness.HarnessError as e:
+            hint = "; pull it first (--pull)" if e.outcome == "image_missing" else ""
+            print(f"vector-miner: cannot run {ref}: {e}{hint}", file=sys.stderr)
+            return 2
+        expert = {"image": ref}
+    bundle = _bundle()
+    if bundle is None:
+        print("vector-miner: warning: no asset bundle here, so the expert runs without /bundle "
+              "(VECTOR_SIM_BUNDLE); see vector-env assets", file=sys.stderr)
+    kp = _keypair(a)
+    launcher = sv.Launcher(expert, docker, bundle, a.stderr)
+    print(f"vector-miner: serving {ref} as {kp.ss58_address} to {api_url} ({a.concurrency} scenes at a time, "
+          f"{a.concurrency if a.warm is None else a.warm} warm)", file=sys.stderr)
+    return sv.run(a.api, ref, kp, launcher, concurrency=a.concurrency, warm=a.warm)
+
+
+def cmd_eval(a) -> int:
+    try:
+        from vector_env import harness
+        from vector_env.cli import EvalError, report
+        from vector_env.compose import SceneError
+        from vector_env.node import SimError
+    except ImportError:
+        raise SystemExit("vector-miner eval needs vector-env (scripts/setup.sh installs it)") from None
+    from . import local
+    if a.command:
+        import shlex
+        expert = {"command": shlex.split(a.command)}
+    elif a.image:
+        expert = {"image": a.image}
+    else:
+        raise SystemExit("give --image REF or --command \"...\"")
+    for k in ("step_deadline", "first_step_deadline"):
+        v = getattr(a, k)
+        if v is not None and not (math.isfinite(v) and v > 0):
+            raise SystemExit(f"--{k.replace('_', '-')} must be a positive number of seconds")
+    docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
+    if a.image and a.pull:
+        try:
+            harness.docker_check(docker)
+            harness.pull(a.image, docker)
+        except harness.HarnessError as e:
+            hint = "; --pull and --image need a running docker daemon" if e.outcome == "docker_unavailable" else ""
+            print(f"vector-miner: cannot pull {a.image}: {e}{hint}", file=sys.stderr)
+            return 2
+    from vector_env.assets import AssetsError
+    n = a.determinism if a.determinism is not None else a.scenes
+    if n < 1:
+        raise SystemExit("--scenes and --determinism must be at least 1")
+    limits = local.deadlines(a.first_step_deadline, a.step_deadline)
+    try:
+        r = local.evaluate(expert, n, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall,
+                           docker=docker, stderr_dir=a.stderr, trace_dir=a.trace,
+                           scene_cache_dir=False if a.no_scene_cache else a.scene_cache, limits=limits,
+                           again=1 if a.determinism is not None else 0)
+    except (AssetsError, EvalError, SceneError, SimError, harness.HarnessError, ValueError) as e:
+        print(f"vector-miner: {e}", file=sys.stderr)
+        return 2
+    if a.determinism is None:
+        code = report(r, a.results, "vector-miner")
+        return _deadline_verdict(a, r, code)
+    return _deadline_verdict(a, r, _determinism(a, r, harness))
+
+
+def _deadline_verdict(a, r: dict, code: int) -> int:
+    from . import local
+    if code == 2:
+        return code
+    lat = r["latency"]
+    for line in local.report_lines(lat):
+        print(f"vector-miner: {line}", file=sys.stderr)
+    if a.strict and lat["late_scenes"] and code == 0:
+        return 1
+    return code
+
+
+def _determinism(a, r: dict, harness) -> int:
+    from vector_env.cli import infra_problem
+    why = infra_problem(r["summary"], r["results"])
+    if why:
+        print(f"vector-miner: {why}", file=sys.stderr)
+        return 2
+    s = r["summary"]
+    again = r["runs"][1]
+    c = harness.compare(r["results"], again)
+    if a.results:
+        with open(a.results, "w") as f:
+            for x in r["results"] + again:
+                f.write(json.dumps(x, separators=(",", ":")) + "\n")
+    out = {"scenes": s["scenes"], "seed": s["seed"], "score": s["score"], "score_again": harness.summary(again)["score"],
+           "determinism": {k: c[k] for k in ("compared", "equal", "all_equal", "mismatched", "infra")},
+           "deadlines": s.get("deadlines")}
+    print(json.dumps(out))
+    if c["all_equal"]:
+        print(f"vector-miner: deterministic on {c['compared']} scenes: every action hash matched", file=sys.stderr)
+        return 0
+    real = [x for x in c["scenes"] if not x["equal"] and not x["infra"]]
+    if not real:
+        print(f"vector-miner: {c['infra']} scenes did not run here both times; nothing differed otherwise: "
+              "not a determinism result", file=sys.stderr)
+        return 2
+    print(f"vector-miner: NOT deterministic: {len(real)} of {c['compared']} scenes sent other rows the second time "
+          f"({', '.join(x['scene_id'] for x in real[:5])}{' ...' if len(real) > 5 else ''}). Phase 2 would disqualify "
+          "this image: seed every random draw from the scene, read no clock, keep threads from racing on results",
+          file=sys.stderr)
+    return 1
+
+
+def _verify_args(a) -> str | None:
+    if a.command and not a.image:
+        return "--command replaces an evaluated image: give --image REF too"
+    if a.workers < 1:
+        return "--workers must be at least 1"
+    if a.scenes < 0 or (a.hash_scenes is not None and a.hash_scenes < 0):
+        return "--scenes and --hash-scenes cannot be negative"
+    for k in ("wall", "cpus"):
+        v = getattr(a, k)
+        if v is not None and not (math.isfinite(v) and v > 0):
+            return f"--{k} must be a positive number"
+    if a.salt_sha256 is not None:
+        a.salt_sha256 = a.salt_sha256.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", a.salt_sha256):
+            return "--salt-sha256 takes the 64 hex characters of the salt commitment"
+    return None
+
+
+def _verify(a) -> int:
+    def bad(msg: str) -> int:
+        print(f"vector-miner: {msg}", file=sys.stderr)
+        return 2
+
+    why = _verify_args(a)
+    if why:
+        return bad(why)
+    if a.submission is None and (a.image or "").strip() != "king":
+        return bad("give --submission ID")
+    return _verify_submission(a, bad)
+
+
+def _king_image(a, bad) -> tuple[str | None, int | None]:
+    """--image king: the king's public image (king.public_image) and its submission, from the board."""
+    if not a.api:
+        return None, bad("--image king reads the king's public image from --api (or VECTOR_MINER_API)")
+    import httpx
+
+    from vector_miner.api import ApiError
+
+    from .api import ExpertApi
+    try:
+        ex = ExpertApi(a.api).expert()
+    except ApiError as e:
+        return None, bad(str(e))
+    except httpx.HTTPError as e:
+        return None, bad(f"cannot reach {a.api}: {e}")
+    king = ex.get("king") if isinstance(ex.get("king"), dict) else None
+    if not king or not king.get("submission"):
+        return None, bad("there is no king yet: --image king needs a decided round")
+    ref = king.get("public_image")
+    if not isinstance(ref, str) or not ref.strip():
+        return None, bad("the king's public image is not published yet (king.public_image is empty); "
+                         "it is published once the round's decision is final")
+    if a.submission is None:
+        a.submission = str(king["submission"])
+    elif a.submission != str(king["submission"]):
+        return None, bad(f"--image king re-runs the king's public image on the king's submission "
+                         f"({king['submission']}), not on {a.submission}")
+    return ref.strip(), None
+
+
+def _verify_submission(a, bad) -> int:
+    from . import subverify as sv
+    from . import verify as vf
+    salt_expect, salt_source = a.salt_sha256, "you gave"
+    king_image = None
+    if (a.image or "").strip() == "king":
+        king_image, code = _king_image(a, bad)
+        if code is not None:
+            return code
+    sid = a.submission
+    try:
+        if a.doc:
+            doc = vf.read_file(a.doc)
+            got = (doc.get("submission") or {}).get("id") if isinstance(doc.get("submission"), dict) else None
+            if got is not None and str(got) != sid:
+                return bad(f"{a.doc} is submission {got}, not {sid}")
+        else:
+            if not a.api:
+                return bad("--api (or VECTOR_MINER_API) is required without --doc")
+            import httpx
+
+            from vector_miner.api import ApiError
+
+            from .api import ExpertApi
+            try:
+                raw = ExpertApi(a.api).submission_verify(sid, vf.MAX_DOC_BYTES)
+            except ApiError as e:
+                return bad(f"submission {sid}: {e.detail}" if e.status == 404 else str(e))
+            except httpx.HTTPError as e:
+                return bad(f"cannot reach {a.api}: {e}")
+            doc = vf.loads(raw)
+            if not a.salt_sha256:
+                try:
+                    v = ExpertApi(a.api).submission(sid)
+                    seen = (v.get("submission") if isinstance(v.get("submission"), dict) else v).get("salt_sha256")
+                except (ApiError, httpx.HTTPError, ValueError, AttributeError) as e:
+                    print(f"vector-miner: warning: the submission view did not load ({e}); checking salt_sha256 "
+                          "against the document only", file=sys.stderr)
+                    seen = None
+                if isinstance(seen, str) and seen:
+                    salt_expect, salt_source = seen.strip().lower()[:64], "of the submission view"
+        if a.save:
+            try:
+                with open(a.save, "w") as f:
+                    json.dump(doc, f, separators=(",", ":"))
+            except OSError as e:
+                return bad(f"cannot write {a.save}: {e}")
+        expert = None
+        if a.command:
+            import shlex
+            try:
+                expert = {"command": shlex.split(a.command)}
+            except ValueError as e:
+                return bad(f"--command: {e}")
+        docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
+        out = sv.verify(doc, hash_scenes=a.hash_scenes, image=a.image, king_image=king_image, expert=expert,
+                        rerun_scenes=a.scenes, sample_seed=a.sample_seed, wall_s=a.wall, workers=a.workers, docker=docker,
+                        salt_sha256=salt_expect, salt_source=salt_source, pull=a.pull,
+                        allow_uncommitted=a.allow_uncommitted)
+    except vf.VerifyError as e:
+        return bad(str(e))
+    print(json.dumps(out, indent=1))
+    return vf.exit_code(out)
+
+
+def cmd_verify(a) -> int:
+    try:
+        return _verify(a)
+    except Exception as e:
+        print(f"vector-miner: cannot check: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+
+
+def main(argv: list[str] | None = None, prog: str = "vector-miner") -> int:
+    ap = argparse.ArgumentParser(prog=prog)
+    common = wallet.common()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    api_default = os.environ.get("VECTOR_MINER_API")
+    c = sub.add_parser("commit", parents=[common], help="commit your image on chain (once: one submission per hotkey, ever)")
+    c.add_argument("--image", required=True)
+    c.add_argument("--network", default="finney")
+    c.add_argument("--netuid", type=int)
+    c.add_argument("--api", default=api_default, help="the public API that tells whether this hotkey already has a submission")
+    c.add_argument("--no-check", action="store_true", help="do not ask the registry whether the image exists")
+    c.add_argument("--no-api-check", action="store_true", help="do not ask the API whether this hotkey already has a submission")
+    c.add_argument("--dev-api", help="a local dev API (no chain): commit there instead")
+    s = sub.add_parser("status", parents=[common], help="your submission: phase-1 progress, queue position, phase 2, "
+                                                        "its rank after the round decision, the verdict")
+    s.add_argument("--api", default=api_default, required=not api_default)
+    s.add_argument("--hotkey", help="an ss58 address instead of the wallet's hotkey")
+    fe = sub.add_parser("fee", help="the submission fee: status (the fee, the vault, your unused payments) or pay "
+                                    "(from your coldkey to the vault, before you commit)")
+    fsub = fe.add_subparsers(dest="fee_cmd", required=True)
+    fs = fsub.add_parser("status", parents=[common], help="the fee, the vault and the unused payments that can back "
+                                                         "this hotkey's next commitment")
+    fs.add_argument("--api", default=api_default)
+    fs.add_argument("--hotkey", help="an ss58 address instead of the wallet's hotkey")
+    fp = fsub.add_parser("pay", parents=[common], help="pay the fee from the wallet's coldkey to the vault (asks first)")
+    fp.add_argument("--api", default=api_default)
+    fp.add_argument("--network", default="finney")
+    fp.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    fp.add_argument("--again", action="store_true", help="pay even when an unused payment already exists")
+    fp.add_argument("--dev-api", help="a local dev API (no chain): pay there instead")
+    sv = sub.add_parser("serve", parents=[common], help="phase 1: connect to the subnet and run your committed image "
+                                                        "locally on the scenes it sends")
+    sv.add_argument("--image", required=True, help="the image you committed (ghcr.io/<you>/<repo>@sha256:<digest>)")
+    sv.add_argument("--api", default=api_default)
+    sv.add_argument("--concurrency", type=int, default=8, help="scenes run at once (the server sends up to 8)")
+    sv.add_argument("--warm", type=int, help="containers started ahead, waiting for a scene (default: --concurrency)")
+    sv.add_argument("--command", help="run a local program per scene instead of the image (local development)")
+    sv.add_argument("--cpus", type=float)
+    sv.add_argument("--memory")
+    sv.add_argument("--docker", help="the docker binary")
+    sv.add_argument("--pull", action="store_true", help="pull the image first when it is not local")
+    sv.add_argument("--stderr", metavar="DIR", help="write each container's stderr to DIR/<container name>.log")
+    e = sub.add_parser("eval", help="local evaluation: random scenes played the way phase 1 plays them, with its "
+                                    "step deadlines")
+    e.add_argument("--image", help="your image (any local tag or ghcr.io/<you>/<repo>@sha256:<digest>)")
+    e.add_argument("--command", help="run a local program instead of the image (while developing)")
+    e.add_argument("--scenes", type=int, default=20)
+    e.add_argument("--seed", type=int, default=0)
+    e.add_argument("--workers", type=int, default=1)
+    e.add_argument("--time-limit", type=float)
+    e.add_argument("--wall", type=float)
+    e.add_argument("--cpus", type=float)
+    e.add_argument("--memory")
+    e.add_argument("--docker", help="the docker binary")
+    e.add_argument("--pull", action="store_true")
+    e.add_argument("--results", help="write the per-scene results here (JSON lines)")
+    e.add_argument("--stderr", metavar="DIR", help="write the expert's stderr of every scene to DIR/<index, 4 digits>-<scene_id>.log")
+    e.add_argument("--trace", metavar="DIR", help="after the run, replay every scene and write DIR/<index, 4 digits>-<scene_id>.json "
+                   "(per tick: row, joints, grip, tcp pose, contacts; why it ended)")
+    e.add_argument("--scene-cache", metavar="DIR", help="keep generated scenes here (default $VECTOR_ENV_SCENE_CACHE, "
+                   "else ~/.cache/vector-env/scenes)")
+    e.add_argument("--no-scene-cache", action="store_true", help="generate every scene afresh and keep none")
+    e.add_argument("--determinism", type=int, metavar="N", help="run N scenes twice and compare every action hash "
+                   "(phase 2 needs them equal)")
+    e.add_argument("--first-step-deadline", type=float, metavar="S", help="seconds the expert has to answer start "
+                   "(phase 1: 10)")
+    e.add_argument("--step-deadline", type=float, metavar="S", help="seconds the expert has to answer each later state "
+                   "(phase 1: 2)")
+    e.add_argument("--strict", action="store_true", help="exit 1 when a scene missed a phase-1 deadline")
+    v = sub.add_parser("verify", help="re-check a final submission: regenerate its scenes from the published salt, "
+                                      "check phase 1, phase 2 and the round decision, optionally re-run the image")
+    v.add_argument("--submission", help="the submission id (with --image king: the king's, by default)")
+    v.add_argument("--api", default=os.environ.get("VECTOR_MINER_API"))
+    v.add_argument("--doc", help="read a saved verify document instead of fetching it")
+    v.add_argument("--save", help="write the fetched document here")
+    v.add_argument("--image", help="re-run an image on --scenes scenes: 'king' (the king's public image, "
+                                   "king.public_image, on the king's submission) or 'submission' (its committed "
+                                   "image; also its reference, digest or hotkey)")
+    v.add_argument("--command", help="with --image: run a local program in its place (no docker)")
+    v.add_argument("--scenes", type=int, default=20, help="scenes to re-run the image on (sampled)")
+    v.add_argument("--hash-scenes", type=int, help="regenerate only this many sampled scenes (default: all)")
+    v.add_argument("--sample-seed", type=int, default=0)
+    v.add_argument("--workers", type=int, default=1)
+    v.add_argument("--wall", type=float)
+    v.add_argument("--cpus", type=float)
+    v.add_argument("--memory")
+    v.add_argument("--docker", help="the docker binary")
+    v.add_argument("--pull", action="store_true")
+    v.add_argument("--salt-sha256", help="the salt commitment shown at commit")
+    v.add_argument("--allow-uncommitted", action="store_true",
+                   help="no salt commitment time (salt_committed_at null) is a warning, not a problem")
+    a = ap.parse_args(argv)
+    return {"commit": cmd_commit, "status": cmd_status, "serve": cmd_serve, "eval": cmd_eval,
+            "verify": cmd_verify, "fee": cmd_fee}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

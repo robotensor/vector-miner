@@ -17,8 +17,8 @@ from bittensor_wallet import Keypair
 from websockets.asyncio.server import serve as ws_serve
 from websockets.exceptions import ConnectionClosed
 
-from vector_miner import serve as sv
 from vector_miner.protocol import connect_message
+from vector_miner.skills.bin_picking.expert import serve as sv
 
 HERE = Path(__file__).resolve().parent
 REF = "ghcr.io/alice/bin-expert@sha256:" + "a" * 64
@@ -177,6 +177,14 @@ def test_ws_url_and_close_codes():
         assert sv.fatal_close(code, reason), reason
     nonce = sv.refusal(4401, "bad_hello: unknown or expired nonce (GET /v1/expert/nonce)")
     assert not nonce["final"] and nonce["nonce"]
+    idle = sv.refusal(4403, "not_running: the competition is planned",
+                      {"reason": "not_running", "message": "the competition is planned",
+                       "retry_at": "2026-11-23T12:00:00+00:00"}, now=now)
+    assert not idle["final"] and idle["wait_s"] == 2 * 3600 and idle["retry_at"] == "2026-11-23T12:00:00+00:00"
+    gone = sv.refusal(4403, "not_running: the competition is finished",
+                      {"reason": "not_running", "message": "the competition is finished"})
+    assert gone["final"] and gone["reason"] == "not_running" and gone["message"] == "the competition is finished"
+    assert sv.fatal_close(4403, "not_running: the competition is paused")
     assert not sv.fatal_close(4408, "timeout: send the hello within 10 s")
 
 
@@ -214,7 +222,7 @@ def test_hello_is_signed_and_scenes_are_bridged_by_key(pids):
     assert not any(alive(p) for p in pids_of(pids)), "every process (warm ones too) must be gone"
 
 
-def test_concurrency_and_warm_pool_give_a_fresh_process_per_scene(pids):
+def test_concurrency_and_warm_containers_give_a_fresh_process_per_scene(pids):
     seen = {"max": 0}
 
     async def script(ws, srv):
@@ -424,13 +432,13 @@ asyncio.run(main())
         miner = f'''
 import sys
 from bittensor_wallet import Keypair
-from vector_miner import serve as sv
+from vector_miner.skills.bin_picking.expert import serve as sv
 cmd = [sys.executable, {str(HERE / "fake_expert.py")!r}, "track", "5"]
 sys.exit(sv.run({api!r}, {REF!r}, Keypair.create_from_uri("//Alice"), sv.Launcher({{"command": cmd}}), concurrency=1,
                 warm=1))
 '''
         p = subprocess.Popen([sys.executable, "-c", miner], stderr=subprocess.PIPE, text=True)
-        while not (tmp_path / "acted").exists():
+        while not (tmp_path / "acted").exists() or len(pids_of(pids)) < 2:
             assert time.time() - t0 < 30 and p.poll() is None
             time.sleep(0.05)
         p.send_signal(signal.SIGTERM)
@@ -490,7 +498,7 @@ def test_image_runs_with_vector_envs_hardened_docker_flags(pids, tmp_path):
 
 
 def test_cli_serve_checks_its_arguments(monkeypatch, capsys):
-    from vector_miner import cli
+    from vector_miner.skills.bin_picking.expert import cli
     monkeypatch.delenv("VECTOR_MINER_API", raising=False)
     with pytest.raises(SystemExit, match="serve the image you committed"):
         cli.main(["serve", "--image", "ghcr.io/a/b:latest", "--api", "http://x"])
@@ -509,7 +517,7 @@ def test_cli_serve_checks_its_arguments(monkeypatch, capsys):
 
 def test_cli_serve_image_needs_it_locally(monkeypatch, capsys, tmp_path):
     pytest.importorskip("vector_env.harness")
-    from vector_miner import cli
+    from vector_miner.skills.bin_picking.expert import cli
     monkeypatch.setattr(cli, "_keypair", lambda a: KP)
     assert cli.main(["serve", "--image", REF, "--api", "http://x", "--docker", str(tmp_path / "none")]) == 2
     assert "cannot run" in capsys.readouterr().err
@@ -696,3 +704,38 @@ def test_a_newer_restart_of_a_scene_replaces_the_older_one(pids):
 
     assert run(main()) == 0
     assert len(got["0.1"]) == 15 and len(got["1.0"]) == 15, got
+
+
+def test_a_leaf_that_is_not_running_waits_for_retry_at_or_stops(pids):
+    logs = []
+    soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=0.05)).isoformat()
+    got = {}
+
+    async def script(ws, srv):
+        r = Router(ws)
+        await ws.send(json.dumps({"type": "welcome", "submission": "sub-1", "status": "phase1", "done": 0, "scenes": 1}))
+        await r.play(0, "0.0", got=got)
+        await ws.send(json.dumps({"type": "done", "submission": "sub-1", "status": "scored", "score": 0.0,
+                                  "successes": 0, "scenes": 1}))
+        await asyncio.sleep(0.2)
+
+    async def main(refusals):
+        async with FakeServer(script, refusals=refusals) as srv:
+            code = await sv.serve(srv.api, REF, KP, sv.Launcher(expert()), concurrency=1, warm=0, backoff=FAST,
+                                  log=logs.append)
+            return code, srv
+
+    planned = ({"reason": "not_running", "message": "the competition is planned", "retry_at": soon}, 4403,
+               "not_running: the competition is planned")
+    code, srv = run(main([planned]))
+    assert code == 0 and srv.conns == 1 and len(srv.hellos) == 2, logs
+    assert len(got["0.0"]) == 15
+    assert any("turned the connection away for now (close 4403: not_running: the competition is planned)" in x
+               and "it opens again at " + soon in x for x in logs), logs
+    logs.clear()
+    for status in ("finished", "paused"):
+        code, srv = run(main([({"reason": "not_running", "message": f"the competition is {status}"}, 4403,
+                               f"not_running: the competition is {status}")]))
+        assert code == 1 and srv.conns == 0 and len(srv.hellos) == 1, logs
+        assert any(f"refused this miner (close 4403): not_running: the competition is {status}" in x for x in logs), logs
+        logs.clear()

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vector-miner"
 version = "0.2.0"
-description = "Miner tools for the Vector subnet's expert competition: evaluate your image locally, commit it once, serve it to phase 1, follow it, verify it"
+description = "The miner kit of the Vector subnet's competitions: evaluate, commit, serve, follow and verify a submission"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -26,4 +26,5 @@ vector-miner = "vector_miner.cli:main"
 include = ["vector_miner*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "skills"]
+norecursedirs = ["node_modules", ".*", "*.egg-info", "example", "base"]

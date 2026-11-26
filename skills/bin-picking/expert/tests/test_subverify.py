@@ -9,10 +9,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from test_verify import ENV, SALT, Scenes, _h
+from conftest import ENV, SALT, Scenes, _h
 
 from vector_miner import api as api_mod
-from vector_miner import cli, subverify, verify
+from vector_miner.skills.bin_picking.expert import cli, subverify, verify
 
 SUB = "ghcr.io/alice/bin-expert@sha256:" + "a" * 64
 KING = "ghcr.io/kate/bin-expert@sha256:" + "c" * 64
