@@ -1,12 +1,38 @@
 #!/usr/bin/env bash
+# Set up this checkout for one leaf: vector-env and vector-sim at the round tag, .venv, the example and the assets.
+#   scripts/setup.sh     VECTOR_MINER_LEAF=<leaf id> picks the leaf when several are here
+# The round tag is ARG VECTOR_SIM_REF= of skills/<skill>/<kind>/example/Dockerfile; VECTOR_ENV_REF and
+# VECTOR_SIM_REF override it, VECTOR_ENV_DIR (default ../vector-env), VECTOR_ENV_GIT and VECTOR_SIM_GIT choose the source.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [ -n "${VECTOR_MINER_LEAF:-}" ]; then
+  LEAF_DIR="skills/${VECTOR_MINER_LEAF%-*}/${VECTOR_MINER_LEAF##*-}"
+  if [ ! -f "$LEAF_DIR/example/Dockerfile" ]; then
+    echo "setup: VECTOR_MINER_LEAF=$VECTOR_MINER_LEAF: no $LEAF_DIR/example/Dockerfile" >&2
+    exit 1
+  fi
+else
+  LEAF_DIR= n=0 names=
+  for f in skills/*/*/example/Dockerfile; do
+    [ -f "$f" ] || continue
+    d=${f%/example/Dockerfile}
+    LEAF_DIR=$d n=$((n + 1)) names="${names:+$names, }$d"
+  done
+  if [ "$n" -eq 0 ]; then
+    echo "setup: no skills/<skill>/<kind>/example/Dockerfile here" >&2
+    exit 1
+  elif [ "$n" -gt 1 ]; then
+    echo "setup: several leaf folders ($names): set VECTOR_MINER_LEAF=<leaf id>" >&2
+    exit 1
+  fi
+fi
+DOCKERFILE="$LEAF_DIR/example/Dockerfile"
+ROUND=$(sed -n 's/^ARG VECTOR_SIM_REF=\([^[:space:]]*\).*/\1/p' "$DOCKERFILE")
 ENV_DIR=${VECTOR_ENV_DIR:-../vector-env}
-ENV_VERSION=$(sed -n 's/.*"vector-env==\([^"]*\)".*/\1/p' pyproject.toml)
-ENV_REF=${VECTOR_ENV_REF:-${ENV_VERSION:+v$ENV_VERSION}}
-SIM_REF=${VECTOR_SIM_REF:-$(sed -n 's/^ARG VECTOR_SIM_REF=\([^[:space:]]*\).*/\1/p' example/Dockerfile)}
+ENV_REF=${VECTOR_ENV_REF:-$ROUND}
+SIM_REF=${VECTOR_SIM_REF:-$ROUND}
 if [ -z "$ENV_REF" ] || [ -z "$SIM_REF" ]; then
-  echo "setup: no vector-env==<version> in pyproject.toml or no ARG VECTOR_SIM_REF=<tag> in example/Dockerfile (or set VECTOR_ENV_REF and VECTOR_SIM_REF)" >&2
+  echo "setup: no ARG VECTOR_SIM_REF=<tag> in $DOCKERFILE (or set VECTOR_ENV_REF and VECTOR_SIM_REF)" >&2
   exit 1
 fi
 check_ref() {
@@ -41,13 +67,13 @@ fi
 SIM_DIR="$(cd "$ENV_DIR/.." && pwd)/vector-sim"
 if [ ! -e ../vector-sim ] && [ -d "$SIM_DIR/js" ]; then
   ln -s "$SIM_DIR" ../vector-sim
-  echo "example: linked ../vector-sim -> $SIM_DIR (the example's @vector/sim is file:../../vector-sim/js)"
+  echo "example: linked ../vector-sim -> $SIM_DIR (the @vector/sim of $LEAF_DIR/example is file:../../../../../vector-sim/js)"
 fi
 if [ -d ../vector-sim/js ]; then
   [ -n "$ENV_SETUP" ] || check_ref ../vector-sim "$SIM_REF" vector-sim
-  (cd example && npm ci --no-audit --no-fund)
+  (cd "$LEAF_DIR/example" && npm ci --no-audit --no-fund)
 else
-  echo "example: no vector-sim beside this folder or beside $ENV_DIR; clone it to ../vector-sim at $SIM_REF (git clone --branch $SIM_REF https://github.com/robotensor/vector-sim ../vector-sim), then (cd example && npm ci)" >&2
+  echo "example: no vector-sim beside this folder or beside $ENV_DIR; clone it to ../vector-sim at $SIM_REF (git clone --branch $SIM_REF ${VECTOR_SIM_GIT:-https://github.com/robotensor/vector-sim} ../vector-sim), then (cd $LEAF_DIR/example && npm ci)" >&2
 fi
 if ! err=$(.venv/bin/vector-env assets pull 2>&1 >/dev/null); then
   echo "assets: not installed yet (${err#vector-env: }); set VECTOR_ENV_ASSETS_SOURCE (hf://<repo> or a folder) or VECTOR_ENV_BUNDLE, then .venv/bin/vector-env assets pull" >&2

@@ -1,5 +1,5 @@
 .venv/
-example/node_modules/
+node_modules/
 *.egg-info/
 __pycache__/
 .pytest_cache/

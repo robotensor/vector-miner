@@ -16,7 +16,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-eval = ["vector-env==0.1.0"]
 chain = ["bittensor==11.3.5"]
 test = ["pytest==9.2.0"]
 
