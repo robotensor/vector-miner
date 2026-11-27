@@ -612,6 +612,8 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
             bad.append("below_king, but phase 2 is published")
     elif ours and p2 is None:
         pass
+    elif st == "not_ranked" and p2 is None and above_bar and len(dec.get("new") or []) >= RANKS:
+        pass
     elif st in FINAL:
         if not above_bar:
             bad.append(f"phase 2 ran, but the phase-1 score {score} is not above {what}")

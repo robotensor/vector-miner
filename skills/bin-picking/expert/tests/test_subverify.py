@@ -688,3 +688,16 @@ def test_scenes_of_several_picks_are_scored_from_their_picks(capsys, env, tmp_pa
                      (_set(["phase1", "mean_time_s"], 1.0), "or of its successful picks")):
         code, got, _ = problems(capsys, tmp_path, _t(doc, fn))
         assert code == 1 and any(want in p for p in got), (want, got)
+
+
+def test_not_ranked_without_phase_2_needs_three_ahead(capsys, env, tmp_path):
+    nr = _t(make_doc(fake_env(broken=BROKEN), "not_ranked"), _set(["phase2"], None))
+    code, got, _ = problems(capsys, tmp_path, nr)
+    assert code == 0 and got == [], got
+    code, got, _ = problems(capsys, tmp_path, _t(nr, _set(["decision", "new"], OTHERS[:2])))
+    assert code == 1 and any("no phase 2 is published" in p for p in got), got
+    pile = make_pile_doc(fake_env(broken=BROKEN), "not_ranked")
+    pile.update(phase2=None, final_score=None)
+    pile["decision"]["new"] = list(OTHERS)
+    code, got, _ = problems(capsys, tmp_path, pile)
+    assert code == 0 and got == [], got
