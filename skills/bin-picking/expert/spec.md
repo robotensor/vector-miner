@@ -46,7 +46,8 @@ variable (`VECTOR_MINER_API`), output line, JSON field and exit code, with these
 - `subverify`: with `score_formula` (formula `pile-1` or `pile-2`) the phase-1 score is the mean of
   `results.score` over the counted scenes, each recomputed from the formula, `task.time_limit_s` and the scene's
   `picks` (divided by `picks_planned`, `task.picks` or the picks listed) or its own success/t/outs/tcp_path_m;
-  `final_score` = (1 − w)·phase 1 + w·`phase2_eval.score` (or phase 1 without an evaluation); the round decision
+  `final_score` = `phase2_eval.score`, the private score (w = `phase2_eval.weight`, 1 when absent: (1 − w)·phase 1 +
+  w·score; phase 1 without a private evaluation); the round decision
   uses the final score, the gate the phase-1 score; both must be above `min_score` (0 when absent). Documents
   without `score_formula` keep the success-rate check.
 - The leaf commands take the wallet flags from `vector_miner.wallet.common()`. The module keeps a module-level

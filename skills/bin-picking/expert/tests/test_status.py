@@ -199,7 +199,7 @@ def test_status_shows_signed_scores_final_eval_outs_and_mean_time(monkeypatch, c
     row.update(status="phase2", phase2_eval={"done": 40, "total": 200, "score": None, "weight": 0.5})
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     s = json.loads(capsys.readouterr().out)["submissions"][0]
-    assert "the evaluation on other assets: 40/200 scenes" in s["verdict"] and s["phase2_eval"]["total"] == 200
+    assert "the private evaluation: 40/200 scenes" in s["verdict"] and s["phase2_eval"]["total"] == 200
     row.update(status="passed", round=3, eval_score=0.1, final_score=-0.575)
     assert cli.main(["status", "--api", "http://api", "--hotkey", HOT]) == 0
     s = json.loads(capsys.readouterr().out)["submissions"][0]

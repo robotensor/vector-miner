@@ -611,7 +611,7 @@ def test_pile_final_score_with_an_evaluation_on_other_assets(capsys, env, tmp_pa
     doc = make_pile_doc(fake_env(broken=BROKEN), "ranked", eval_score=0.2)
     code, got, out = problems(capsys, tmp_path, doc)
     assert code == 0 and got == [], got
-    assert any("evaluation on other assets" in w for w in out["document"]["warnings"]), out["document"]
+    assert any("private evaluation" in w for w in out["document"]["warnings"]), out["document"]
     code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["final_score"], doc["final_score"] + 0.1)))
     assert code == 1 and any("is not (1 - 0.5)" in p for p in got), got
     p1 = doc["phase1"]["score"]

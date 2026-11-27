@@ -85,7 +85,7 @@ def verdict(s: dict, ex: dict) -> str:
         line = ("phase 2: we run your committed image in docker (--network none) on a sample of your scenes; every "
                 "action hash must equal phase 1's")
         if ev:
-            line += (f"; the evaluation on other assets: {_num(ev.get('done')) or 0}/{_num(ev.get('total')) or '?'} "
+            line += (f"; the private evaluation: {_num(ev.get('done')) or 0}/{_num(ev.get('total')) or '?'} "
                      "scenes")
         return line
     if st == "passed":

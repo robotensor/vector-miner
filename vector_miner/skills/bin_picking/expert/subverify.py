@@ -531,27 +531,30 @@ def _decision_problems(doc: dict, st: str, p2: dict | None) -> list[str]:
 
 
 def _final_problems(doc: dict, st: str, warnings: list) -> list[str]:
-    """final_score = (1 - weight) * phase-1 score + weight * the evaluation's score when the round had an evaluation
-    on other assets (phase2_eval), else the phase-1 score. The evaluation's scenes are not published: its score is
-    taken as published."""
+    """final_score = the private evaluation's score when the round had one (phase2_eval, weight 1; a document with
+    another weight w: (1 - w) * phase-1 score + w * that score), else the phase-1 score. The private scenes are not
+    published: its score is taken as published."""
     fs, ev = doc.get("final_score"), doc.get("phase2_eval") or None
     p1 = (doc.get("phase1") or {}).get("score")
     if fs is None:
         if st in ("ranked", "not_ranked") and ev is not None:
-            return [f"{st} after an evaluation on other assets, but the document has no final_score"]
+            return [f"{st} after a private evaluation, but the document has no final_score"]
         return []
     if p1 is None:
         return ["final_score is published without a phase-1 score"]
     if ev is None:
-        return [] if _close(fs, p1, MEAN_TOL) else [f"final_score {fs} is not the phase-1 score {p1} (no evaluation "
-                                                     "on other assets in this round)"]
+        return [] if _close(fs, p1, MEAN_TOL) else [f"final_score {fs} is not the phase-1 score {p1} (no private "
+                                                     "evaluation in this round)"]
     w, es = ev.get("weight"), ev.get("score")
-    if w is None or es is None:
-        return [f"final_score {fs} is published, but the evaluation on other assets has no score or weight"]
+    w = 1.0 if w is None else float(w)
+    if es is None:
+        return [f"final_score {fs} is published, but the private evaluation has no score"]
     want = (1.0 - float(w)) * float(p1) + float(w) * float(es)
-    warnings.append(f"the evaluation on other assets ({ev.get('scenes')} scenes, score {es}, weight {w}) is not "
+    warnings.append(f"the private evaluation ({ev.get('scenes')} scenes, score {es}) is not "
                     "published scene by scene; its score is taken as published")
     if not _close(fs, want, MEAN_TOL):
+        if w == 1.0:
+            return [f"final_score {fs} is not the private score {es}"]
         return [f"final_score {fs} is not (1 - {w}) * {p1} + {w} * {es} = {round(want, 6)}"]
     return []
 

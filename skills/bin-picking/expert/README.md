@@ -486,7 +486,7 @@ decision), the API publishes everything needed to check it at
 vector-env version and asset sha256 the scenes were made with, every scene's seed and state hash, the score formula
 (`score_formula`), phase 1 (score and per-scene success, time, outcome, action hash, scene score, outs, path length,
 and per pick its outcome, time, outs and path), phase 2 (the scenes, their action hashes and wall times), the
-evaluation on other assets as a summary (`phase2_eval`: scenes, score, weight, outs, mean time), `final_score` and the
+private evaluation as a summary (`phase2_eval`: scenes, score, outs, mean time), `final_score` and the
 decision `{round, bar, rank_at, new}` (the bar, the rank it entered with, the submission ids that entered at its
 round's decision); `submission.mirror_url` names the subnet's private copy of the image, which only the team can
 pull. Checking the document and regenerating the scenes needs no image. There is no king run to check.
@@ -534,8 +534,8 @@ flowchart LR
   its own success, `t`, `outs` and `tcp_path_m`; `phase1.outs` is the sum of the counted scenes' outs. A document
   without `score_formula` (older rounds) keeps the older rule: successes / scenes with a verdict. `mean_time_s` matches the
   robot time of the successful scenes (a scene succeeds when every pick does) or of the successful picks. `final_score` is the phase-1 score, or
-  `(1 - weight) * phase-1 + weight * phase2_eval.score` when the round had an evaluation on other assets (its scenes
-  are not published, so its score is taken as published, with a warning). `below_king` needs a phase-1 score not
+  the private score (`phase2_eval.score`) when the round had a private evaluation (its scenes are not published, so
+  its score is taken as published, with a warning). `below_king` needs a phase-1 score not
   above `decision.bar` or not above the minimum score (`min_score`, 0 when the document has none) and no phase 2;
   any other final status needs one above both, and a phase 2 on the sample rule's scenes: the `phase2_scenes` (the
   submission's own, 20 by default) indexes with the smallest `sha256(f"{salt}:phase2:{index}")`, sorted, among the phase-1 scenes with an
