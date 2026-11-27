@@ -14,7 +14,7 @@ image once per hotkey, serve phase 1, follow the submission and verify it. The m
 | `vector_miner/skills/bin_picking/expert/{board,local,serve,subverify,verify}.py` | status, local eval, phase 1, verify |
 | `skills/bin-picking/expert/example/` | the example expert: `solve.mjs`, `package.json`, `package-lock.json`, `Dockerfile`, `README.md` |
 | `skills/bin-picking/expert/base/` | the base image: `Dockerfile`, `build.sh`, `expert.mjs`, `README.md` |
-| `skills/bin-picking/expert/tests/` | tests, their `conftest.py`, `fake_docker.py`, `fake_expert.py` |
+| `skills/bin-picking/expert/tests/` | tests, their `conftest.py`, `fake_docker.py`, `fake_expert.py`, `fake_play.py` |
 | `skills/bin-picking/expert/README.md` | the miner guide |
 
 Modules moved together from `vector_miner/`, so relative imports between them are unchanged. They import shared
@@ -40,8 +40,27 @@ variable (`VECTOR_MINER_API`), output line, JSON field and exit code, with these
   then close `4403` with reason `not_running: <message>`) like `not_open`: with a `retry_at` it waits until then and
   connects again; without one it exits 1 with the reason.
 - The ranked verdict reads `rank <k> · <share> of bin-picking-expert's emission` (`(the king)` appended for rank 1).
+- Scores are signed numbers with 3 decimals (`+0.712`, `-1.250`, `0.000`), never percentages. `status` copies
+  the board's `phase2_eval` and each row's `eval_score`, `final_score`, `phase2_eval`, `phase1.outs`,
+  `phase1.mean_time_s` when the API gives them; `passed` and `not_ranked` verdicts use the final score.
+- `subverify`: with `score_formula` (formula `pile-1` or `pile-2`) the phase-1 score is the mean of
+  `results.score` over the counted scenes, each recomputed from the formula, `task.time_limit_s` and the scene's
+  `picks` (divided by `picks_planned`, `task.picks` or the picks listed) or its own success/t/outs/tcp_path_m;
+  `final_score` = (1 − w)·phase 1 + w·`phase2_eval.score` (or phase 1 without an evaluation); the round decision
+  uses the final score, the gate the phase-1 score; both must be above `min_score` (0 when absent). Documents
+  without `score_formula` keep the success-rate check.
 - The leaf commands take the wallet flags from `vector_miner.wallet.common()`. The module keeps a module-level
   `_keypair` that the commands call (tests replace it).
+
+- `serve` (phase 1 on the miner's machine, section 5) replaces the step bridge: `--concurrency N` is an optional cap
+  on the scenes run at once here (default: none, the server's `scenes_at_once`); `--warm` is accepted and has no effect
+  (one note line on stderr); `--stderr DIR` keeps each scene's expert stderr in `DIR/<index:04d>-<scene_id>.log`.
+  `serve` needs a vector-env with `harness.check_claim` (else it exits with one line).
+- `eval` runs its scenes with `harness.run` (the phase-1 path) and reports `expert_time` (`wall_s`, `pick_max_s`,
+  `pick_mean_s`, `picks`, `over_scenes`) instead of `deadlines`; `--strict` exits 1 when a pick's `expert_s` is over
+  `--wall`. `--first-step-deadline` and `--step-deadline` are accepted, hidden, and have no effect (one note line).
+- `status`: the `phase1` verdict is `phase 1: <done>/<total> scenes answered by your miner (run on your machine)`
+  `; claimed score so far <score> (phase 2 re-runs a sample)` (when the API gives a score) `; keep serve running`.
 
 ## 3. API
 
@@ -67,11 +86,42 @@ ends_at} | null, "final_round", "round_mode", "interval_s", "fee"}`. The kit rea
 
 ## 4. Changes inside the leaf
 
-- The containers started ahead are the class `serve.Warm`; `local` uses it.
 - `local`, `verify`, `subverify` and `serve` import vector-env only by the names listed in the repository spec,
-  inside functions, as before.
+  inside functions, as before. The step bridge (`Launcher`, `Expert`, `Warm`, `Bridge`) and `local.Local` /
+  `local.latency` are gone.
 
-## 5. Example and base image
+## 5. Phase 1: `serve`
+
+The server sends whole scenes; the miner's machine runs each with vector-env's harness and answers with its claim.
+
+```
+server -> {"type":"welcome", submission, status, done, scenes, scenes_at_once, scene_deadline_s}
+server -> {"type":"scene","index":i,"scene":{scene_id, seed, xml, meta, checkpoint, state_hash, target, target_class,
+          env},"limits":{time_limit_s, picks, max_rows, tick_s, control_hz, wall_s, score, max_abs?}}
+miner  -> {"type":"result","index":i,"result":harness.wire_result(result, limits)}
+server -> {"type":"ack","index":i,"ok":bool,"reason":str|null,"score":float|null}
+server -> {"type":"done", ...} | {"type":"error", reason, message, index?}
+```
+
+- `serve.Runner(expert, docker=None, stderr_dir=None, cap=None, log=_log, argv=None)`: `on_scene(m)` starts one
+  process per scene (`argv`, default `[python, "-c", CHILD]`, own session) that runs `serve.play(job)`:
+  `harness.run(expert, [scene], time_limit_s, wall_s=limits.wall_s or env.yaml, docker, stderr_dir,
+  bundle=assets.for_scene(scene))`, then `wire_result(r, limits)` and `check_claim(scene, claim, limits)`; a failure
+  there answers `harness_error` with no rows (`serve.failed`). A claim that fails `check_claim` is still sent, with
+  a warning. Image experts get `--label vector-miner.serve=<tag>` (docker `args`), so `close()` kills exactly this
+  miner's containers (`docker ps --filter label=...`, `docker kill`), then each scene's process group.
+- Answers outlive a connection: `claims[index]` is kept, `unacked` holds the indexes without an `ack`; every
+  `welcome` re-sends the unacked ones. A `scene` whose index and `scene_id` are running or answered is not run
+  again (an answered one is sent again); the same index with another `scene_id` runs that scene.
+- `serve.serve(api, image, keypair, runner, *, stop=None, backoff=BACKOFF, log=_log, max_attempts=None)` keeps the
+  hello, the refusal handling, the backoff, `done` and `review` exactly as before; a dropped connection leaves the
+  runs going. `serve.run(api, image, keypair, runner)` adds the signal handlers.
+- Log lines: one per scene answered (`scene <i> (<id>): <outcome> (<k>/<P> picks, <outs> out, t=..., expert ...),
+  claimed score <s>  [<answered>/<total> scenes answered, claimed score <mean> over <n> here (<a> accepted, <r>
+  rejected)]`), a rejected ack, the welcome (`the server sends N scenes at a time; each scene must be answered
+  within ...`), and at the end `done: <n> scenes answered here (<outcome counts>; claimed score <mean>)`.
+
+## 6. Example and base image
 
 - `example/package.json`: `"@vector/sim": "file:../../../../../vector-sim/js"` (vector-sim beside this checkout);
   `package-lock.json` regenerated; `solve.mjs` unchanged.
@@ -85,12 +135,14 @@ ends_at} | null, "final_round", "round_mode", "interval_s", "fee"}`. The kit rea
   default image tag `vector-expert-base:<ref>`; labels `vector-sim.ref` and `vector-sim.commit`.
 - `base/Dockerfile` and `base/expert.mjs` unchanged.
 
-## 6. Tests
+## 7. Tests
 
 - `skills/bin-picking/expert/tests/conftest.py`: an autouse fixture setting `VECTOR_ENV_SCENE_CACHE` to a temporary
   folder, and the helpers the test modules share.
 - Test modules: `test_commit.py` (commit, fee), `test_status.py` (status, verdicts), `test_eval.py` (eval,
-  determinism, deadlines), `test_serve.py`, `test_subverify.py`, `test_verify.py`. The example is
+  determinism, expert time), `test_serve.py` (a fake subnet; `fake_play.py` as the scene process; with a bundle, real
+  scenes through the harness as a command and a fake docker, every answer checked with `check_claim`),
+  `test_subverify.py`, `test_verify.py`. The example is
   `HERE.parent / "example" / "solve.mjs"`.
 - Shared tests (`tests/test_protocol.py`, `tests/test_chain.py`, `tests/test_dispatch.py`, `tests/test_setup.py`)
   are the repository's.
