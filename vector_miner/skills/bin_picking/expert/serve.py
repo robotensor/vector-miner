@@ -150,9 +150,9 @@ def play(job: dict) -> dict:
 
 
 def failed(sc: dict, error: str, wall: float = 0.0) -> dict:
-    """A scene this machine could not run (no bundle, a broken vector-env): an infra result with no rows."""
+    """A scene this machine could not run (no bundle, a broken vector-env): an infra result with no actions."""
     return {"scene_id": sc.get("scene_id"), "outcome": "harness_error", "success": False, "error": error, "infra": True,
-            "ctrl": "", "n": 0, "act_rows": [], "dropped_ctrl": "", "action_hash": None, "rows_sent": 0, "t": 0.0,
+            "action_hash": None, "rows_sent": 0, "t": 0.0,
             "tick": 0, "outs": 0, "out_parts": [], "tcp_path_m": 0.0, "joint_path_rad": 0.0, "crate_hits": 0,
             "target_class": sc.get("target_class"), "score": None, "expert_s": 0.0, "wall_s": round(wall, 3)}
 
@@ -337,6 +337,10 @@ class Runner:
                     self.on_ack(m)
                 elif t == "welcome":
                     self.log(_welcome(m))
+                    why = mismatch(m)
+                    if why:
+                        self.log(why)
+                        return "mismatch"
                     total, done_n = m.get("scenes", m.get("total")), m.get("done")
                     if isinstance(total, int) and not isinstance(total, bool):
                         self.total = total
@@ -403,6 +407,34 @@ async def _kill_labelled(binary: str, label: str) -> None:
     except (OSError, asyncio.TimeoutError):
         pass
 
+def local_pin() -> dict:
+    """This machine's vector-env version and vector-sim code pin (what it runs phase 1 with)."""
+    import vector_env
+    from vector_env.skills.bin_picking import verifier
+    return {"version": getattr(vector_env, "__version__", None), "sim": (verifier.pin() or {}).get("code")}
+
+
+def mismatch(m: dict) -> str | None:
+    """Why this vector-miner must not play the submission the welcome names: its phase 1 is of another kind, or this
+    machine runs another vector-env or vector-sim than the subnet re-runs claims with."""
+    mode = m.get("phase1")
+    if mode is not None and mode != "scene":
+        return (f"this submission's phase 1 runs in {mode} mode, which this vector-miner does not play: run the "
+                "vector-miner of the round you committed in (its round tag)")
+    want = m.get("env") or {}
+    if not (want.get("version") or want.get("sim")):
+        return None
+    try:
+        have = local_pin()
+    except Exception as e:
+        return f"this machine's vector-env / vector-sim cannot be read ({type(e).__name__}: {e}); run scripts/setup.sh"
+    for k, name in (("version", "vector-env version"), ("sim", "vector-sim code pin")):
+        if want.get(k) and have.get(k) != want.get(k):
+            return (f"this machine has {name} {have.get(k)!r}, the subnet re-runs claims with {want.get(k)!r}: "
+                    "set up the round tag (scripts/setup.sh) before serving, or phase 2 cannot reproduce your claims")
+    return None
+
+
 def _welcome(m: dict) -> str:
     line = "connected"
     if m.get("submission") is not None:
@@ -468,6 +500,9 @@ async def serve(api: str, image: str, keypair, runner: Runner, *, stop: asyncio.
                     done, _ = await asyncio.wait({run, halt}, return_when=asyncio.FIRST_COMPLETED)
                     if run in done:
                         halt.cancel()
+                        if run.result() == "mismatch":
+                            await ws.close(1000, "this miner cannot play this submission")
+                            return 1
                         if run.result() == "done":
                             await ws.close(1000, "phase 1 finished")
                             m = runner.done or {}

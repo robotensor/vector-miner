@@ -329,7 +329,8 @@ def test_a_scene_that_cannot_run_here_is_answered_as_harness_error(pids):
 
     assert run(main()) == 0
     r = got[0]["result"]
-    assert (r["outcome"], r["infra"], r["score"], r["action_hash"], r["n"]) == ("harness_error", True, None, None, 0)
+    assert (r["outcome"], r["infra"], r["score"], r["action_hash"], r["rows_sent"]) == ("harness_error", True, None, None, 0)
+    assert "ctrl" not in r and "n" not in r
     assert "exited 3" in r["error"] and "the harness broke" in r["error"]
 
 
@@ -714,3 +715,28 @@ def test_a_leaf_that_is_not_running_waits_for_retry_at_or_stops(pids):
         assert code == 1 and srv.conns == 0 and len(srv.hellos) == 1, logs
         assert any(f"refused this miner (close 4403): not_running: the competition is {status}" in x for x in logs), logs
         logs.clear()
+
+
+@pytest.mark.parametrize("welcome, why", [
+    ({"phase1": "relay"}, "relay mode"),
+    ({"phase1": "scene", "env": {"version": "0.0.0-other", "sim": None}}, "vector-env version"),
+    ({"phase1": "scene", "env": {"version": None, "sim": "0" * 64}}, "vector-sim code pin"),
+])
+def test_serve_refuses_a_submission_it_cannot_play(pids, monkeypatch, welcome, why):
+    logs = []
+    monkeypatch.setattr(sv, "local_pin", lambda: {"version": "0.2.0", "sim": "f" * 64})
+
+    async def script(ws, srv):
+        await ws.send(json.dumps({"type": "welcome", "scenes": 2, "done": 0, **welcome}))
+        await asyncio.sleep(0.5)
+
+    async def main():
+        async with FakeServer(script) as srv:
+            return await sv.serve(srv.api, REF, KP, runner("ok"), backoff=FAST, log=logs.append)
+
+    assert run(main()) == 1
+    assert any(why in line for line in logs), logs
+
+
+def test_a_matching_env_pin_plays():
+    assert sv.mismatch({"phase1": "scene", "env": {"version": None, "sim": None}}) is None

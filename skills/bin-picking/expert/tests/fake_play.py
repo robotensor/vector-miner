@@ -17,8 +17,8 @@ if mode == "crash":
     sys.exit(3)
 time.sleep(secs)
 score = round(0.1 * (job["index"] + 1), 6)
-claim = {"scene_id": sc["scene_id"], "outcome": "done", "success": False, "error": None, "infra": False, "ctrl": "",
-         "n": 0, "act_rows": [], "dropped_ctrl": "", "action_hash": "cbf29ce484222325", "rows_sent": 0, "t": 0.0,
+claim = {"scene_id": sc["scene_id"], "outcome": "done", "success": False, "error": None, "infra": False,
+         "action_hash": "cbf29ce484222325", "rows_sent": 0, "t": 0.0,
          "tick": 0, "outs": 0, "out_parts": [], "tcp_path_m": 0.0, "joint_path_rad": 0.0, "crate_hits": 0,
          "target_class": None, "score": score, "expert_s": 0.0, "wall_s": secs, "picks": [], "picks_planned": 10,
          "successes": 0}
