@@ -701,3 +701,28 @@ def test_not_ranked_without_phase_2_needs_three_ahead(capsys, env, tmp_path):
     pile["decision"]["new"] = list(OTHERS)
     code, got, _ = problems(capsys, tmp_path, pile)
     assert code == 0 and got == [], got
+
+
+def test_the_phase2_sample_seed_and_the_expert_time_per_pick(capsys, env, tmp_path):
+    doc = make_doc(fake_env(broken=BROKEN), "ranked")
+    rows, res = doc["scenes"], doc["phase1"]["results"]
+    ok = [x["index"] for x in rows]
+    h = "0x" + "ab" * 32
+    seed = hashlib.sha256(f"{h}:phase2:{SID}".encode()).hexdigest()
+    pick = sorted(sorted(ok, key=lambda i: hashlib.sha256(f"{seed}:phase2:{i}".encode()).hexdigest())[:6])
+    pos = {x["index"]: k for k, x in enumerate(rows)}
+    doc["phase2"].update(scenes=pick, outcome=[res["outcome"][pos[i]] for i in pick],
+                         action_hash=[res["action_hash"][pos[i]] for i in pick], wall_s=[300.0] * 6,
+                         pick_expert_s=[[1.0, 2.0]] * 6, sample_seed={"source": "chain", "block": 7, "hash": h,
+                                                                      "seed": seed})
+    doc.update(wall_s=45.0, scene_wall_s=90.0)
+    code, probs, out = problems(capsys, tmp_path, doc)
+    assert not [p for p in probs if "phase 2" in p or "sample" in p], probs
+    assert out["phase2"]["over_wall"] == [] and out["phase2"]["passed"]
+    doc["phase2"]["pick_expert_s"] = [[1.0, 50.0]] + [[1.0, 2.0]] * 5
+    code, probs, out = problems(capsys, tmp_path, doc)
+    assert out["phase2"]["over_wall"] == [pick[0]]
+    doc["phase2"]["pick_expert_s"] = [[1.0, 2.0]] * 6
+    doc["phase2"]["sample_seed"] = {**doc["phase2"]["sample_seed"], "seed": "f" * 64}
+    code, probs, out = problems(capsys, tmp_path, doc)
+    assert any("sample seed is not sha256" in p for p in probs), probs

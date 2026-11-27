@@ -400,9 +400,10 @@ def phase2_check(doc: dict) -> dict | None:
         return None
     pos = {x["index"]: k for k, x in enumerate(doc["scenes"])}
     idx, hs, ws = p2.get("scenes") or [], p2.get("action_hash") or [], p2.get("wall_s") or []
-    outs = p2.get("outcome") or []
+    outs, per_pick = p2.get("outcome") or [], p2.get("pick_expert_s") or []
     pub = (doc["phase1"]["results"].get("action_hash") or [])
-    cap = doc.get("wall_s")
+    per = doc.get("wall_s")
+    cap = doc.get("scene_wall_s", per)
     mism, over, unknown, infra = [], [], [], []
     for j, i in enumerate(idx):
         if i not in pos or pos[i] >= len(pub):
@@ -415,8 +416,13 @@ def phase2_check(doc: dict) -> dict | None:
         h, p = (hs[j] if j < len(hs) else None), pub[pos[i]]
         if p is None or h != p:
             mism.append(i)
-        w = ws[j] if j < len(ws) else None
-        if o == "wall_timeout" or (cap is not None and float(w or 0.0) > float(cap)):
+        picks = per_pick[j] if j < len(per_pick) else None
+        if picks:
+            slow = per is not None and any(x is not None and float(x) > float(per) for x in picks)
+        else:
+            w = ws[j] if j < len(ws) else None
+            slow = cap is not None and float(w or 0.0) > float(cap)
+        if o == "wall_timeout" or slow:
             over.append(i)
     n = len(idx) - len(unknown) - len(infra)
     return {"scenes": len(idx), "compared": n, "equal": n - len(mism), "mismatched": mism, "over_wall": over,
@@ -449,13 +455,33 @@ def _sample_problems(doc: dict, p2: dict) -> list[str]:
           if res["action_hash"][k] and res["outcome"][k] not in out and _verdict(res, k)]
     got = doc["phase2"].get("scenes") or []
     k = doc.get("phase2_scenes")
-    want = phase2_sample(doc["salt"], ok, len(got) if k is None else k)
+    seed, bad = sample_seed(doc)
+    if bad:
+        return bad
+    want = phase2_sample(seed, ok, len(got) if k is None else k)
     if got != want:
         size = f"{len(want)} = min(phase2_scenes {k}, {len(ok)})" if k is not None else str(len(got))
         left = f", leaving out {', '.join(sorted(out))}" if doc.get("excluded_outcomes") is not None else ""
         return [f"phase 2 ran on other scenes than the sample rule picks from the {len(ok)} eligible phase-1 "
-                f"scenes{left} (the {size} smallest sha256(salt:phase2:index), sorted: {want[:10]})"]
+                f"scenes{left} (the {size} smallest sha256(seed:phase2:index), sorted: {want[:10]})"]
     return []
+
+
+def sample_seed(doc: dict) -> tuple[str, list[str]]:
+    """The seed of the phase-2 sample: the salt for a relayed phase 1, else the published beacon. A chain beacon is
+    checked: its seed must be sha256(f"{block hash}:phase2:{submission id}")."""
+    got = (doc.get("phase2") or {}).get("sample_seed") or {"source": "salt"}
+    src = got.get("source")
+    if src == "salt":
+        return doc["salt"], []
+    if not got.get("seed"):
+        return doc["salt"], [f"phase 2 publishes no sample seed (source {src})"]
+    if src == "chain":
+        want = hashlib.sha256(f"{got.get('hash')}:phase2:{doc['submission']['id']}".encode()).hexdigest()
+        if got["seed"] != want:
+            return got["seed"], [f"the phase-2 sample seed is not sha256(block {got.get('block')} hash:phase2:"
+                                 "submission)"]
+    return str(got["seed"]), []
 
 
 def is_legacy(doc: dict) -> bool:

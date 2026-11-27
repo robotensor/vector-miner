@@ -540,13 +540,16 @@ flowchart LR
   its score is taken as published, with a warning). `below_king` needs a phase-1 score not
   above `decision.bar` or not above the minimum score (`min_score`, 0 when the document has none) and no phase 2;
   any other final status needs one above both, and a phase 2 on the sample rule's scenes: the `phase2_scenes` (the
-  submission's own, 20 by default) indexes with the smallest `sha256(f"{salt}:phase2:{index}")`, sorted, among the phase-1 scenes with an
+  submission's own, 20 by default) indexes with the smallest `sha256(f"{seed}:phase2:{index}")`, sorted, where `seed` is
+  `phase2.sample_seed.seed` (a chain seed must equal `sha256(f"{block hash}:phase2:{submission id}")` of the block it
+  names; the salt when `sample_seed` is missing or its source is `salt`), among the phase-1 scenes with an
   action hash and an outcome not in `excluded_outcomes` (the infrastructure outcomes, `not_run` and the cut-offs
   `step_timeout`, `disconnected`, `wall_timeout`; a document that leaves out any other outcome is a problem; one
   without the field is read with the older rule, only infrastructure failures and `not_run` left out). Each phase-2
   scene has an outcome, an action hash and a wall time; phase-2 infrastructure failures are left out of the
   comparison, and it passes when at least one scene is compared, every hash equals phase 1's and no scene is a
-  `wall_timeout` or over `wall_s`; `disqualified` needs a phase 2 that did not pass and a reason, or a reason
+  `wall_timeout` or has a pick whose expert time (`phase2.pick_expert_s`) is over `wall_s` (without per-pick times: a
+  scene wall time over `scene_wall_s`); `disqualified` needs a phase 2 that did not pass and a reason, or a reason
   that starts with `image no longer available` / `repeated failures on our side` (then nothing after phase 1 is
   needed); `ranked` and `not_ranked` need phase 2 passed. The decision: `decision.round` is the submission's
   `round`; `ranked` needs its id in `decision.new` (at most three, no repeats), a final score above the bar and a
