@@ -1,6 +1,6 @@
 # Example expert
 
-An almost blind `vector-expert/2` expert: the message loop with the harness, packaged as an image. It reads only the
+An almost blind `vector-expert/2` and `/3` expert: the message loop with the harness, packaged as an image. It reads only the
 arm's start pose, lowers the arm a little, closes the gripper and goes back up, the same motion for every scene. It
 never looks at the parts or the target, so most scenes end without a pick (score about 0). Copy it and write your
 own `plan()`.

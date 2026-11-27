@@ -3,8 +3,8 @@
 `vector-expert-base` is a starting image for your expert. It contains Node 24, `@vector/sim` of the round the
 harness runs (in `/vector-sim/js`, installed in `/expert`), and a placeholder expert at `/expert/expert.mjs`.
 
-The placeholder only shows the `vector-expert/2` message loop: it holds the start pose with the gripper open, so
-every scene ends `timed_out` (score 0). It passes the deadline and determinism checks. [../example/](../example/README.md)
+The placeholder only shows the `vector-expert/2` and `/3` message loop: it holds the arm's pose with the gripper
+open, so every pick ends `timed_out` (score 0). It passes the expert-time and determinism checks. [../example/](../example/README.md)
 is the same loop with a fixed blind motion, packaged with `@vector/sim` and a Dockerfile.
 
 ## Use it
