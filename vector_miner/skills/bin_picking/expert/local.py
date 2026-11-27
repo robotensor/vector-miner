@@ -10,17 +10,20 @@ def _err(*x) -> None:
 
 def expert_time(results: list[dict], wall_s: float) -> dict:
     """The expert's own time per pick (vector-env's `expert_s`, the simulation left out) against the per-pick wall
-    budget: phase 2 measures it in its re-run and a pick over `wall_s` fails the submission."""
+    budget: phase 2 measures it in its re-run and a pick over `wall_s` fails the submission. A pick that ended in
+    `wall_timeout` is over, whatever its rounded time."""
     picks = []
     for r in results:
         rows = r.get("picks") if isinstance(r.get("picks"), list) else [r]
         for p in rows:
             x = p.get("expert_s")
             if isinstance(x, (int, float)) and not isinstance(x, bool):
-                picks.append((float(x), r.get("scene_id"), p.get("pick", 0)))
-    over = [{"scene_id": sid, "pick": k, "s": round(x, 3)} for x, sid, k in picks if x >= wall_s]
-    return {"wall_s": float(wall_s), "pick_max_s": round(max(x for x, _, _ in picks), 3) if picks else None,
-            "pick_mean_s": round(sum(x for x, _, _ in picks) / len(picks), 3) if picks else None,
+                ended = p.get("outcome") == "wall_timeout" or (p is not r and r.get("outcome") == "wall_timeout"
+                                                                and p is rows[-1])
+                picks.append((float(x), r.get("scene_id"), p.get("pick", 0), ended))
+    over = [{"scene_id": sid, "pick": k, "s": round(x, 3)} for x, sid, k, ended in picks if ended or x >= wall_s]
+    return {"wall_s": float(wall_s), "pick_max_s": round(max(x for x, *_ in picks), 3) if picks else None,
+            "pick_mean_s": round(sum(x for x, *_ in picks) / len(picks), 3) if picks else None,
             "picks": len(picks), "over": over[:50], "over_scenes": sorted({x["scene_id"] for x in over}, key=str)}
 
 
