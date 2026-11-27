@@ -359,7 +359,7 @@ def _set(path, v):
     ("ranked", _set(["submission", "image"], "ghcr.io/alice/bin-expert:latest"), "not an accepted pinned image"),
     ("not_ranked", _set(["submission", "status"], "ranked"), "decision.rank_at is null"),
     ("below_king", _set(["decision", "bar"], 0.1), "below_king, but the phase-1 score"),
-    ("below_king", _set(["decision", "bar"], None), "no king: every score counts"),
+    ("below_king", _set(["decision", "bar"], None), "(no king) and above the minimum score 0"),
     ("disqualified", lambda d: (d["phase2"].update(reason=None), d["submission"].update(reason=None)),
      "disqualified without a reason"),
     ("disqualified", _set(["phase2", "scenes", 0], 999), "not in the list"),
@@ -549,3 +549,142 @@ def test_phase1_cut_offs_stay_out_of_the_phase2_sample(capsys, env, tmp_path):
         code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, d), "--hash-scenes", "0")
         got = (out or {}).get("document", {}).get("problems", []) if out else [err]
         assert code in (1, 2) and any(problem in p for p in got), (problem, got)
+
+
+FORMULA = {"formula": "pile-1", "time_weight": 0.5, "path_weight": 0.0, "path_ref_m": 3.0, "out_unit": 1.0}
+
+
+def make_pile_doc(e, status="ranked", eval_score=None, weight=0.5, **kw):
+    """A document of a set with a score formula: per-scene scores with the time factor and the outs penalty."""
+    doc = make_doc(e, status, **kw)
+    p1, lim = doc["phase1"], doc["task"]["time_limit_s"]
+    res = p1["results"]
+    n = len(res["success"])
+    res["outs"] = [{4: 1, 8: 4}.get(k, 0) for k in range(n)]
+    res["tcp_path_m"] = [round(1.0 + 0.1 * k, 3) for k in range(n)]
+    res["joint_path_rad"] = [2.0] * n
+    res["crate_hits"] = [0] * n
+    res["target_class"] = ["top", "blocked", "buried", "hidden"] * (n // 4) + ["top"] * (n % 4)
+    res["score"] = [None if not subverify._verdict(res, k) else
+                    round(subverify.scene_score(bool(res["success"][k]), res["t"][k], res["outs"][k],
+                                                res["tcp_path_m"][k], FORMULA, lim), 6) for k in range(n)]
+    counted = [k for k in range(n) if subverify._verdict(res, k)]
+    p1["score"] = sum(res["score"][k] for k in counted) / len(counted)
+    p1["outs"] = sum(res["outs"][k] for k in counted)
+    doc["score_formula"] = dict(FORMULA)
+    doc["min_score"] = -1000.0  # a round whose floor lets negative scores rank
+    if eval_score is None:
+        doc["phase2_eval"] = None
+        doc["final_score"] = p1["score"] if status in ("ranked", "not_ranked") else None
+    else:
+        doc["phase2_eval"] = {"scenes": 20, "counted": 20, "successes": 9, "outs": 3, "mean_time_s": 9.5, "infra": 0,
+                              "score": eval_score, "weight": weight}
+        doc["final_score"] = (1 - weight) * p1["score"] + weight * eval_score
+    if status == "below_king":
+        doc["decision"]["bar"] = p1["score"]
+    else:
+        doc["decision"]["bar"] = min(p1["score"], doc["final_score"] or p1["score"]) - 0.05
+    return doc
+
+
+def test_pile_scores_follow_the_formula(capsys, env, tmp_path):
+    doc = make_pile_doc(fake_env(broken=BROKEN), "ranked")
+    assert doc["phase1"]["score"] < 0  # outs make it negative
+    code, got, out = problems(capsys, tmp_path, doc)
+    assert code == 0 and got == [], got
+    k = next(k for k, v in enumerate(doc["phase1"]["results"]["success"]) if v)
+    for fn, want in ((_set(["phase1", "results", "score", k], 1.0), "scene scores do not follow the score formula"),
+                     (_set(["phase1", "score"], 0.5), "is not the mean scene score"),
+                     (_set(["phase1", "outs"], 99), "99 outs published"),
+                     (_set(["phase1", "results", "outs", k], 2), "scene scores do not follow the score formula"),
+                     (_set(["phase1", "results", "score"], None), "scene scores are expected"),
+                     (_set(["score_formula", "formula"], "other-9"), "unknown score formula"),
+                     (_set(["final_score"], 0.9), "is not the phase-1 score")):
+        code, got, _ = problems(capsys, tmp_path, _t(doc, fn))
+        assert code == 1 and any(want in p for p in got), (want, got)
+    # a different time weight changes every successful scene's score
+    code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["score_formula", "time_weight"], 0.0)))
+    assert code == 1 and any("do not follow the score formula" in p for p in got), got
+
+
+def test_pile_final_score_with_an_evaluation_on_other_assets(capsys, env, tmp_path):
+    doc = make_pile_doc(fake_env(broken=BROKEN), "ranked", eval_score=0.2)
+    code, got, out = problems(capsys, tmp_path, doc)
+    assert code == 0 and got == [], got
+    assert any("evaluation on other assets" in w for w in out["document"]["warnings"]), out["document"]
+    code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["final_score"], doc["final_score"] + 0.1)))
+    assert code == 1 and any("is not (1 - 0.5)" in p for p in got), got
+    p1 = doc["phase1"]["score"]
+    # the round decision ranks by the final score: phase 1 above the bar, the final score below it
+    worse = make_pile_doc(fake_env(broken=BROKEN), "ranked", eval_score=p1 - 2.0)
+    worse["decision"]["bar"] = p1 - 0.5
+    code, got, _ = problems(capsys, tmp_path, worse)
+    assert code == 1 and any("ranked, but the final score" in p for p in got), got
+    nr = make_pile_doc(fake_env(broken=BROKEN), "not_ranked", eval_score=p1 - 2.0)
+    nr["decision"].update(bar=p1 - 0.5, new=[])
+    code, got, out = problems(capsys, tmp_path, nr)
+    assert code == 0 and got == [] and out["decision"]["above_bar"] is False, got
+    code, got, _ = problems(capsys, tmp_path, _t(nr, _set(["final_score"], None)))
+    assert code == 1 and any("has no final_score" in p for p in got), got
+
+
+def test_pile_below_king_and_negative_bars(capsys, env, tmp_path):
+    doc = make_pile_doc(fake_env(broken=BROKEN), "below_king")
+    assert problems(capsys, tmp_path, doc)[:2] == (0, [])
+    code, got, _ = problems(capsys, tmp_path, _t(doc, _set(["decision", "bar"], doc["phase1"]["score"] - 1.0)))
+    assert code == 1 and any("below_king, but the phase-1 score" in p for p in got), got
+
+
+def test_pile_scores_without_a_king_need_the_minimum_score(capsys, env, tmp_path):
+    low = make_pile_doc(fake_env(broken=BROKEN), "below_king")
+    low["decision"]["bar"] = None
+    del low["min_score"]  # no min_score published: the floor is 0
+    assert low["phase1"]["score"] < 0 and problems(capsys, tmp_path, low)[:2] == (0, [])
+    code, got, _ = problems(capsys, tmp_path, _t(low, _set(["min_score"], -100.0)))
+    assert code == 1 and any("above the minimum score -100" in p for p in got), got
+    # phase 1 above the floor, the final score below it: not ranked, although nobody entered
+    nr = make_pile_doc(fake_env(broken=BROKEN), "not_ranked", eval_score=-5.0)
+    nr["decision"].update(bar=None, new=[])
+    nr["min_score"] = (nr["phase1"]["score"] + nr["final_score"]) / 2
+    code, got, out = problems(capsys, tmp_path, nr)
+    assert code == 0 and got == [] and out["decision"]["above_bar"] is False, got
+
+
+def make_picks_doc(e, status="ranked", picks=10):
+    """Scenes of several picks in the same bin: scene score = (sum of pick scores - outs penalty) / picks."""
+    doc = make_pile_doc(e, status)
+    res, lim = doc["phase1"]["results"], doc["task"]["time_limit_s"]
+    doc["task"]["picks"] = picks
+    n = len(res["success"])
+    res["picks"], res["score"], res["outs"] = [], [], []
+    for k in range(n):
+        row = []
+        for i in range(picks - (k % 3)):  # some scenes end early: no eligible target left
+            ok = (k + i) % 3 != 0
+            row.append({"target": i, "target_class": "top", "outcome": "success" if ok else "missed",
+                        "t": round(3.0 + i * 0.7, 3), "tick": 60 + i, "outs": 1 if (k == 4 and i == 2) else 0,
+                        "out_parts": [], "tcp_path_m": 1.2, "joint_path_rad": 2.0, "crate_hits": 0})
+        sc, outs = subverify.picks_score(row, FORMULA, lim, picks)
+        res["picks"].append(row)
+        res["score"].append(round(sc, 6) if subverify._verdict(res, k) else None)
+        res["outs"].append(outs)
+    counted = [k for k in range(n) if subverify._verdict(res, k)]
+    doc["phase1"]["score"] = sum(res["score"][k] for k in counted) / len(counted)
+    doc["phase1"]["outs"] = sum(res["outs"][k] for k in counted)
+    doc["phase1"]["mean_time_s"] = statistics.fmean(pk["t"] for x in res["picks"] for pk in x if pk["outcome"] == "success")
+    doc["final_score"] = doc["phase1"]["score"] if status in ("ranked", "not_ranked") else None
+    doc["decision"]["bar"] = doc["phase1"]["score"] - 0.05 if status != "below_king" else doc["phase1"]["score"]
+    return doc
+
+
+def test_scenes_of_several_picks_are_scored_from_their_picks(capsys, env, tmp_path):
+    doc = make_picks_doc(fake_env(broken=BROKEN), "ranked")
+    assert 0 < doc["phase1"]["score"] < 1
+    code, got, _ = problems(capsys, tmp_path, doc)
+    assert code == 0 and got == [], got
+    for fn, want in ((_set(["phase1", "results", "picks", 0, 0, "outcome"], "success"), "do not follow the score formula"),
+                     (_set(["phase1", "results", "picks", 4, 2, "outs"], 0), "its picks 0"),
+                     (_set(["task", "picks"], 5), "do not follow the score formula"),
+                     (_set(["phase1", "mean_time_s"], 1.0), "or of its successful picks")):
+        code, got, _ = problems(capsys, tmp_path, _t(doc, fn))
+        assert code == 1 and any(want in p for p in got), (want, got)

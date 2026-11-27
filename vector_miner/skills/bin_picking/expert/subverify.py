@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import math
 import re
 import statistics
 from fractions import Fraction
@@ -15,7 +16,7 @@ from .verify import (MAX_SCENES, VerifyError, _arr, _bad, _env, _flag, _int, _nu
 try:
     from vector_env.rules import INFRA_OUTCOMES
 except ImportError:
-    INFRA_OUTCOMES = ("harness_error", "scene_error", "docker_unavailable", "image_missing", "pull_failed", "start_failed", "policy_unavailable")
+    INFRA_OUTCOMES = ("harness_error", "scene_error", "docker_unavailable", "image_missing", "pull_failed", "start_failed", "policy_unavailable", "physics_error")
 
 FORMAT = "vector-submission-verify/1"
 SEED_N = 0
@@ -27,6 +28,12 @@ INFRA = frozenset(INFRA_OUTCOMES)
 NOT_RUN = "not_run"
 CUT_OFF = frozenset({"step_timeout", "disconnected", "wall_timeout"})
 OUR_SIDE = ("image no longer available", "repeated failures on our side")
+FORMULAS = ("pile-1", "pile-2")
+SCORE_KEYS = ("time_weight", "path_weight", "path_ref_m", "out_unit")
+OUTS_CAP = 30
+SCORE_TOL = 1e-4  # per scene: published scores carry 6 decimals and t 3
+MEAN_TOL = 1e-5
+MAX_PICKS = 1000
 
 
 def frac(x) -> Fraction:
@@ -70,6 +77,24 @@ def _results(res: dict, where: str) -> None:
         _str(v, f"{where}.outcome[{j}]", 64)
     for j, v in enumerate(_arr(res.get("action_hash"), f"{where}.action_hash", MAX_SCENES)):
         _hash(v, f"{where}.action_hash[{j}]")
+    for k in ("score", "tcp_path_m", "joint_path_rad"):
+        for j, v in enumerate(_arr(res.get(k), f"{where}.{k}", MAX_SCENES, null=True)):
+            _num(v, f"{where}.{k}[{j}]")
+    for k in ("outs", "crate_hits", "picks_planned"):
+        for j, v in enumerate(_arr(res.get(k), f"{where}.{k}", MAX_SCENES, null=True)):
+            _int(v, f"{where}.{k}[{j}]", 0, 1 << 31, null=True)
+    for j, v in enumerate(_arr(res.get("target_class"), f"{where}.target_class", MAX_SCENES, null=True)):
+        _str(v, f"{where}.target_class[{j}]", 32)
+    for j, v in enumerate(_arr(res.get("picks"), f"{where}.picks", MAX_SCENES, null=True)):
+        for i, pk in enumerate(_arr(v, f"{where}.picks[{j}]", MAX_PICKS, null=True)):
+            w = f"{where}.picks[{j}][{i}]"
+            _obj(pk, w, null=False)
+            for k in ("t", "tcp_path_m", "joint_path_rad", "score"):
+                _num(pk.get(k), f"{w}.{k}")
+            for k in ("outs", "crate_hits", "tick", "target"):
+                _int(pk.get(k), f"{w}.{k}", 0, 1 << 31, null=True)
+            for k in ("outcome", "target_class"):
+                _str(pk.get(k), f"{w}.{k}", 64)
 
 
 def _ints(v, where: str) -> None:
@@ -119,6 +144,19 @@ def validate(doc: dict) -> None:
     _num(p1.get("mean_time_s"), "phase1.mean_time_s")
     for f in ("successes", "counted", "infra"):
         _int(p1.get(f), f"phase1.{f}", 0, MAX_SCENES, null=True)
+    _int(p1.get("outs"), "phase1.outs", 0, 1 << 40, null=True)
+    sf = _obj(doc.get("score_formula"), "score_formula")
+    _str(sf.get("formula"), "score_formula.formula", 64)
+    for k in SCORE_KEYS:
+        _num(sf.get(k), f"score_formula.{k}")
+    _num(doc.get("final_score"), "final_score")
+    _num(doc.get("min_score"), "min_score")
+    ev = _obj(doc.get("phase2_eval"), "phase2_eval")
+    for k in ("score", "weight", "mean_time_s"):
+        _num(ev.get(k), f"phase2_eval.{k}")
+    for k in ("scenes", "counted", "successes", "infra"):
+        _int(ev.get(k), f"phase2_eval.{k}", 0, MAX_SCENES, null=True)
+    _int(ev.get("outs"), "phase2_eval.outs", 0, 1 << 40, null=True)
     _results(_obj(p1.get("results"), "phase1.results", null=False), "phase1.results")
     p2 = _obj(doc.get("phase2"), "phase2")
     if p2:
@@ -196,12 +234,34 @@ def _lengths(name: str, part: dict, count: int) -> list[str]:
     return []
 
 
+def _pick_list(res: dict, count: int) -> list | None:
+    p = res.get("picks")
+    return p if isinstance(p, list) and len(p) == count else None
+
+
+def _pick_successes(res: dict, count: int) -> int | None:
+    """Successful picks over the scenes of several picks (results.picks), None without picks."""
+    p = _pick_list(res, count)
+    if p is None:
+        return None
+    return sum(1 for x in p if isinstance(x, list) for pk in x
+               if isinstance(pk, dict) and (pk.get("outcome") == "success" or pk.get("success") is True))
+
+
 def _times(name: str, part: dict) -> list[str]:
     res = part["results"]
     ts = [float(t) for v, t in zip(res["success"], res["t"]) if v and t is not None]
-    if ts and part.get("mean_time_s") is not None and abs(statistics.fmean(ts) - float(part["mean_time_s"])) > 1e-3:
-        return [f"{name}: mean time {part['mean_time_s']} is not the mean of its successful scenes"]
-    return []
+    p = _pick_list(res, len(res["success"]))
+    # several picks per scene: the mean of the successful scenes' whole-scene times, or of the successful picks' times
+    tp = [float(pk["t"]) for x in (p or []) if isinstance(x, list) for pk in x if isinstance(pk, dict)
+          and pk.get("t") is not None and (pk.get("outcome") == "success" or pk.get("success") is True)]
+    have = part.get("mean_time_s")
+    if have is None or not (ts or tp):
+        return []
+    if any(xs and abs(statistics.fmean(xs) - float(have)) <= 1e-3 for xs in (ts, tp)):
+        return []
+    return [f"{name}: mean time {have} is not the mean of its successful scenes"
+            + (" or of its successful picks" if p is not None else "")]
 
 
 def _near(a, b) -> bool:
@@ -212,7 +272,8 @@ def _verdict(res: dict, k: int) -> bool:
     return not is_infra(res["outcome"][k], res["success"][k])
 
 
-def _score(name: str, part: dict, count: int) -> list[str]:
+def _score(name: str, part: dict, count: int, formula: dict | None = None, time_limit_s=None,
+           task: dict | None = None) -> list[str]:
     bad = _lengths(name, part, count)
     if bad:
         return bad
@@ -220,16 +281,117 @@ def _score(name: str, part: dict, count: int) -> list[str]:
     ok = sum(1 for v in res["success"] if v)
     counted = sum(1 for k in range(count) if _verdict(res, k))
     infra = count - counted
-    if part.get("successes") is not None and ok != part["successes"]:
-        bad.append(f"{name}: {part['successes']} successes published, {ok} in the results")
+    picked = _pick_successes(res, count)
+    if part.get("successes") is not None and part["successes"] not in (ok, picked):
+        what = f"{ok} in the results" + (f" ({picked} successful picks)" if picked is not None else "")
+        bad.append(f"{name}: {part['successes']} successes published, {what}")
     if part.get("counted") is not None and part["counted"] != counted:
         bad.append(f"{name}: {part['counted']} scenes counted published, {counted} with a verdict in the results")
     if part.get("infra") is not None and part["infra"] != infra:
         bad.append(f"{name}: {part['infra']} infrastructure failures published, {infra} in the results")
-    if not _near(part.get("score"), ok / max(1, counted)):
-        left = f" ({infra} infrastructure failures left out)" if infra else ""
-        bad.append(f"{name}: score {part.get('score')} is not {ok}/{counted}{left}")
+    left = f" ({infra} infrastructure failures left out)" if infra else ""
+    if formula is None:
+        if not _near(part.get("score"), ok / max(1, counted)):
+            bad.append(f"{name}: score {part.get('score')} is not {ok}/{counted}{left}")
+        return bad + _times(name, part)
+    bad += _scene_scores(name, part, count, formula, time_limit_s, left, task)
     return bad + _times(name, part)
+
+
+def scene_score(success: bool, t, outs, tcp_path_m, formula: dict, time_limit_s: float) -> float:
+    """One scene's score under the document's score_formula (pile-1):
+    s * (1 - time_weight * min(1, t / time_limit_s)) * (1 - path_weight * min(1, tcp_path_m / path_ref_m))
+    - out_unit * (2 ** min(outs, 30) - 1), s = 1 on success, else 0."""
+    tw, pw = float(formula.get("time_weight") or 0.0), float(formula.get("path_weight") or 0.0)
+    ref, unit = float(formula.get("path_ref_m") or 0.0), float(formula.get("out_unit", 1.0) or 0.0)
+    n = max(0, int(outs or 0))
+    pen = unit * (2 ** min(n, OUTS_CAP) - 1)
+    if not success:
+        return 0.0 - pen
+    f_time = 1.0 - tw * min(1.0, max(0.0, float(t or 0.0)) / max(1e-9, float(time_limit_s)))
+    f_path = 1.0 - pw * (min(1.0, max(0.0, float(tcp_path_m or 0.0)) / ref) if ref > 0 else 0.0)
+    return f_time * f_path - pen
+
+
+def picks_score(picks: list, formula: dict, time_limit_s: float, n_picks: int | None = None) -> tuple[float, int]:
+    """A scene of several picks in the same bin: (sum over picks of s_i * f_time_i * f_path_i - out_unit *
+    (2 ** min(K, 30) - 1)) / P, K = the outs of all its picks, P = the picks a scene has (`n_picks`, else the picks
+    listed). Each pick's t is its own robot time, against the per-pick time limit. Returns (score, K)."""
+    unit = float(formula.get("out_unit", 1.0) or 0.0)
+    gain, k_outs = 0.0, 0
+    for pk in picks:
+        pk = pk if isinstance(pk, dict) else {}
+        k_outs += max(0, int(pk.get("outs") or 0))
+        if pk.get("outcome") == "success" or pk.get("success") is True:
+            gain += scene_score(True, pk.get("t"), 0, pk.get("tcp_path_m"), formula, time_limit_s)
+    n = int(n_picks) if n_picks else max(1, len(picks))
+    return (gain - unit * (2 ** min(k_outs, OUTS_CAP) - 1)) / n, k_outs
+
+
+def _n_picks(doc_task: dict, formula: dict) -> int | None:
+    for v in (formula.get("picks"), (doc_task or {}).get("picks")):
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return v
+    return None
+
+
+def _close(a, b, tol: float) -> bool:
+    return a is not None and abs(float(a) - float(b)) <= tol * max(1.0, abs(float(b)))
+
+
+def _scene_scores(name: str, part: dict, count: int, formula: dict, time_limit_s, left: str,
+                  task: dict | None = None) -> list[str]:
+    """A document with score_formula: the score is the mean scene score over the counted scenes, and each scene's
+    score follows from the formula, the task's time limit and the scene's success, t, outs and tcp_path_m, or, for a
+    scene of several picks (results.picks), from its picks (picks_score)."""
+    res, bad = part["results"], []
+    picks = res.get("picks") if isinstance(res.get("picks"), list) and len(res["picks"]) == count else None
+    n_picks = _n_picks(task or {}, formula)
+    planned = res.get("picks_planned") if isinstance(res.get("picks_planned"), list) and \
+        len(res["picks_planned"]) == count else None
+    scores = res.get("score")
+    if not isinstance(scores, list) or len(scores) != count:
+        return [f"{name}: the document has a score_formula, so {count} scene scores are expected (results.score)"]
+    if formula.get("formula") not in FORMULAS:
+        return [f"{name}: unknown score formula {formula.get('formula')!r} (this vector-miner knows "
+                f"{', '.join(FORMULAS)}); the scene scores are not checked"]
+    if time_limit_s is None:
+        return [f"{name}: the document has no task.time_limit_s: the scene scores cannot be checked"]
+    outs = res.get("outs") if isinstance(res.get("outs"), list) and len(res["outs"]) == count else None
+    path = res.get("tcp_path_m") if isinstance(res.get("tcp_path_m"), list) and len(res["tcp_path_m"]) == count else None
+    got, wrong, total_outs = [], [], 0
+    for k in range(count):
+        if not _verdict(res, k):
+            continue
+        o = outs[k] if outs else 0
+        if picks is not None and isinstance(picks[k], list) and picks[k]:
+            want, k_outs = picks_score(picks[k], formula, time_limit_s, (planned[k] if planned else None) or n_picks)
+            if outs and int(o or 0) != k_outs:
+                bad.append(f"{name}: scene {k + 1} of the list has {o} outs, its picks {k_outs}")
+            o = k_outs
+        else:
+            want = scene_score(bool(res["success"][k]), res["t"][k], o, path[k] if path else 0.0, formula,
+                               time_limit_s)
+            if picks is not None and n_picks:
+                want /= n_picks
+        total_outs += int(o or 0)
+        have = scores[k]
+        if have is None:
+            have = 0.0 if res["outcome"][k] == NOT_RUN else None
+        if have is None or not _close(have, want, SCORE_TOL):
+            wrong.append((k, have, want))
+        got.append(float(have) if have is not None else want)
+    if wrong:
+        k, have, want = wrong[0]
+        bad.append(f"{name}: {len(wrong)} scene scores do not follow the score formula (first: scene "
+                   f"{k + 1} of the list published {have}, the formula gives {round(want, 6)})")
+    mean = math.fsum(got) / len(got) if got else 0.0
+    if part.get("score") is None or not _close(part["score"], mean, MEAN_TOL):
+        bad.append(f"{name}: score {part.get('score')} is not the mean scene score {round(mean, 6)} of the "
+                   f"{len(got)} counted scenes{left}")
+    if outs and part.get("outs") is not None and int(part["outs"]) != total_outs:
+        bad.append(f"{name}: {part['outs']} outs published, {total_outs} in the counted scenes' results")
+    return bad
 
 
 def phase2_check(doc: dict) -> dict | None:
@@ -303,15 +465,31 @@ def is_legacy(doc: dict) -> bool:
     return sub.get("status") in LEGACY or (old and "bar" not in dec and "rank_at" not in dec)
 
 
-def eligible(doc: dict) -> bool:
-    """The phase-1 score is above the bar (decision.bar, the king's score + margin; null: no king, every score
-    counts). An older document has decision.king_best and the margin instead."""
+def final_of(doc: dict):
+    """The score the round decision ranks by: final_score, else (older documents, no phase 2) the phase-1 score."""
+    got = doc.get("final_score")
+    return got if got is not None else (doc.get("phase1") or {}).get("score")
+
+
+def eligible(doc: dict, final: bool = False) -> bool:
+    """The phase-1 score (final: the final score) is above the minimum score (min_score, 0 when the document has
+    none) and above the bar (decision.bar, the king's score + margin; null: no king). The phase-1 score is compared
+    with the bar before phase 2, the final score at the round decision. An older document has decision.king_best
+    and the margin instead."""
     dec = doc.get("decision") or {}
-    score = (doc.get("phase1") or {}).get("score") or 0
+    score = (final_of(doc) if final else (doc.get("phase1") or {}).get("score")) or 0
     if is_legacy(doc):
         best = dec.get("king_best")
         return best is None or above(score, best, doc.get("margin"))
+    if frac(score) <= frac(min_score(doc)):
+        return False
     return dec.get("bar") is None or frac(score) > frac(dec["bar"])
+
+
+def min_score(doc: dict) -> float:
+    """The floor a score must be above to rank: the document's min_score, else 0."""
+    v = doc.get("min_score")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else 0.0
 
 
 def decision_check(doc: dict) -> dict | None:
@@ -320,7 +498,7 @@ def decision_check(doc: dict) -> dict | None:
         return None
     sid, new = (doc.get("submission") or {}).get("id"), dec.get("new") or []
     return {"round": dec.get("round"), "bar": dec.get("bar"), "rank_at": dec.get("rank_at"), "new": len(new),
-            "entered": sid in new, "above_bar": eligible(doc)}
+            "entered": sid in new, "above_bar": eligible(doc, final=True)}
 
 
 def _decision_problems(doc: dict, st: str, p2: dict | None) -> list[str]:
@@ -339,17 +517,43 @@ def _decision_problems(doc: dict, st: str, p2: dict | None) -> list[str]:
             bad.append("ranked, but decision.rank_at is null")
         elif at > len(new):
             bad.append(f"rank_at {at}, but only {len(new)} submissions entered (the new ones take ranks 1..{len(new)})")
-        if not eligible(doc):
-            bad.append(f"ranked, but the phase-1 score {doc['phase1'].get('score')} is not above the bar {dec.get('bar')}")
+        if not eligible(doc, final=True):
+            bad.append(f"ranked, but the final score {final_of(doc)} is not above the bar {dec.get('bar')}")
     else:
         if at is not None:
             bad.append(f"{st}, but decision.rank_at is {at}")
         if sid in new:
             bad.append(f"{st}, but decision.new names this submission")
-    if st == "not_ranked" and eligible(doc) and p2 is not None and p2["passed"] and len(new) < RANKS:
+    if st == "not_ranked" and eligible(doc, final=True) and p2 is not None and p2["passed"] and len(new) < RANKS:
         bad.append(f"not_ranked, but its score is above the bar {dec.get('bar')} and only {len(new)} submissions "
                    f"entered at round {dec.get('round')}'s decision (up to {RANKS} do)")
     return bad
+
+
+def _final_problems(doc: dict, st: str, warnings: list) -> list[str]:
+    """final_score = (1 - weight) * phase-1 score + weight * the evaluation's score when the round had an evaluation
+    on other assets (phase2_eval), else the phase-1 score. The evaluation's scenes are not published: its score is
+    taken as published."""
+    fs, ev = doc.get("final_score"), doc.get("phase2_eval") or None
+    p1 = (doc.get("phase1") or {}).get("score")
+    if fs is None:
+        if st in ("ranked", "not_ranked") and ev is not None:
+            return [f"{st} after an evaluation on other assets, but the document has no final_score"]
+        return []
+    if p1 is None:
+        return ["final_score is published without a phase-1 score"]
+    if ev is None:
+        return [] if _close(fs, p1, MEAN_TOL) else [f"final_score {fs} is not the phase-1 score {p1} (no evaluation "
+                                                     "on other assets in this round)"]
+    w, es = ev.get("weight"), ev.get("score")
+    if w is None or es is None:
+        return [f"final_score {fs} is published, but the evaluation on other assets has no score or weight"]
+    want = (1.0 - float(w)) * float(p1) + float(w) * float(es)
+    warnings.append(f"the evaluation on other assets ({ev.get('scenes')} scenes, score {es}, weight {w}) is not "
+                    "published scene by scene; its score is taken as published")
+    if not _close(fs, want, MEAN_TOL):
+        return [f"final_score {fs} is not (1 - {w}) * {p1} + {w} * {es} = {round(want, 6)}"]
+    return []
 
 
 def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str = "you gave",
@@ -382,7 +586,8 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
     p1 = doc["phase1"]
     ours = ended_on_our_side(doc)
     if not (ours and p1.get("score") is None):
-        bad += _score("phase 1", p1, count)
+        task = doc.get("task") or {}
+        bad += _score("phase 1", p1, count, doc.get("score_formula") or None, task.get("time_limit_s"), task)
     margin = float(doc.get("margin") or 0.0)
     dec = doc.get("decision") or {}
     legacy = is_legacy(doc)
@@ -399,7 +604,7 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
     if st == "below_king":
         if above_bar:
             bad.append(f"below_king, but the phase-1 score {score} is above {what}"
-                       + ("" if bar is not None else " (no king: every score counts)"))
+                       + ("" if bar is not None else f" (no king) and above the minimum score {min_score(doc):g}"))
         if p2 is not None:
             bad.append("below_king, but phase 2 is published")
     elif ours and p2 is None:
@@ -430,6 +635,7 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
             if st in ("ranked", "not_ranked", "crowned", "not_crowned") and not p2["passed"]:
                 bad.append(f"{st}, but phase 2 did not pass (mismatched {p2['mismatched'][:10]}, "
                            f"over the wall {p2['over_wall'][:10]}, compared {p2['compared']})")
+    bad += _final_problems(doc, st, warnings)
     if not legacy:
         bad += _decision_problems(doc, st, p2)
     if dec.get("crowned") is not None and bool(dec["crowned"]) != (st == "crowned"):
