@@ -549,3 +549,11 @@ def test_phase1_cut_offs_stay_out_of_the_phase2_sample(capsys, env, tmp_path):
         code, out, err = run(capsys, "--submission", SID, "--doc", write(tmp_path, d), "--hash-scenes", "0")
         got = (out or {}).get("document", {}).get("problems", []) if out else [err]
         assert code in (1, 2) and any(problem in p for p in got), (problem, got)
+
+
+def test_not_ranked_without_phase_2_needs_three_ahead(capsys, env, tmp_path):
+    nr = _t(make_doc(fake_env(broken=BROKEN), "not_ranked"), _set(["phase2"], None))
+    code, got, _ = problems(capsys, tmp_path, nr)
+    assert code == 0 and got == [], got
+    code, got, _ = problems(capsys, tmp_path, _t(nr, _set(["decision", "new"], OTHERS[:2])))
+    assert code == 1 and any("no phase 2 is published" in p for p in got), got
