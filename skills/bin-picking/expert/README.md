@@ -40,9 +40,11 @@ A scene is a bin filled to between half and two thirds of its depth with a rando
 8 kinds. A scene is 10 picks in a row from the same bin; the robot goes on from where it is after each pick. For each
 pick the subnet names one target part: lift it out and hold it above the lift line, alone, for the hold time. Each
 pick has 15 s of robot time. Targets are not only the free ones on top: a target can be blocked (other parts lie on
-it or press against it), partly buried, or hidden from the camera under one layer of parts, never deeper. You may
-move other parts inside the bin (push them, lift them and put them down); lifting a part that is not the target is
-not a failure, and a dropped target can be tried again until the pick's time runs out. The next pick's target is
+it or press against it), partly buried, or hidden: not visible to the camera, covered by one or two layers of parts.
+Only one part may be picked at a time: the moment two or more parts are above the lift line at the same tick, the
+pick ends as a failure (`multi_pick`, pick score 0). You may move other parts inside the bin (push them, lift them
+one at a time and put them down); lifting one part that is not the target is not a failure, and a dropped target
+can be tried again until the pick's time runs out. The next pick's target is
 named when a pick ends, never a part a pick of this scene already failed on; when no target is left the scene ends
 early and its remaining picks score 0. Scenes may also come from other assets in the same format (phase 2).
 
