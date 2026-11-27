@@ -135,7 +135,7 @@ def test_each_old_path_is_the_leaf_module():
         new = importlib.import_module(f"vector_miner.skills.bin_picking.expert.{name}")
         assert old is new and sys.modules[f"vector_miner.{name}"] is new
     from vector_miner import serve, subverify
-    assert serve.Warm is importlib.import_module("vector_miner.skills.bin_picking.expert.serve").Warm
+    assert serve.Runner is importlib.import_module("vector_miner.skills.bin_picking.expert.serve").Runner
     assert subverify.verify is importlib.import_module("vector_miner.skills.bin_picking.expert.subverify").verify
 
 
@@ -153,7 +153,7 @@ def test_a_threaded_first_import_of_an_old_path_resolves_every_name():
             "    b.wait()\n"
             "    try:\n"
             "        from vector_miner.subverify import verify\n"
-            "        from vector_miner.serve import Warm\n"
+            "        from vector_miner.serve import Runner\n"
             "    except Exception as e:\n"
             "        errs.append(repr(e))\n"
             "ts = [threading.Thread(target=go) for _ in range(4)]\n"

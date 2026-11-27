@@ -288,7 +288,7 @@ def cmd_serve(a) -> int:
         ref = parse_image(a.image)["ref"]
     except BadImage as e:
         raise SystemExit(f"bad image reference: {e} (serve the image you committed)") from None
-    if a.concurrency < 1 or (a.warm is not None and a.warm < 0):
+    if (a.concurrency is not None and a.concurrency < 1) or (a.warm is not None and a.warm < 0):
         raise SystemExit("--concurrency must be at least 1 and --warm at least 0")
     try:
         api_url = sv.ws_url(_api_or_exit(a, "serve connects to the subnet's API"))
@@ -313,15 +313,24 @@ def cmd_serve(a) -> int:
             print(f"vector-miner: cannot run {ref}: {e}{hint}", file=sys.stderr)
             return 2
         expert = {"image": ref}
-    bundle = _bundle()
-    if bundle is None:
-        print("vector-miner: warning: no asset bundle here, so the expert runs without /bundle "
-              "(VECTOR_SIM_BUNDLE); see vector-env assets", file=sys.stderr)
+    try:
+        from vector_env import harness as _h
+    except ImportError:
+        raise SystemExit("vector-miner serve needs vector-env (scripts/setup.sh installs it)") from None
+    if not hasattr(_h, "check_claim"):
+        raise SystemExit("vector-miner serve needs a vector-env with harness.check_claim: update vector-env to this "
+                         "round's tag")
+    if _bundle() is None:
+        print("vector-miner: warning: no asset bundle here, so no scene can run: get it with vector-env assets pull",
+              file=sys.stderr)
+    if a.warm is not None:
+        print("vector-miner: note: --warm has no effect now: each scene starts its own container", file=sys.stderr)
     kp = _keypair(a)
-    launcher = sv.Launcher(expert, docker, bundle, a.stderr)
-    print(f"vector-miner: serving {ref} as {kp.ss58_address} to {api_url} ({a.concurrency} scenes at a time, "
-          f"{a.concurrency if a.warm is None else a.warm} warm)", file=sys.stderr)
-    return sv.run(a.api, ref, kp, launcher, concurrency=a.concurrency, warm=a.warm)
+    runner = sv.Runner(expert, docker, a.stderr, cap=a.concurrency)
+    cap = f"at most {a.concurrency} at a time here" if a.concurrency else "as many at a time as the server sends"
+    print(f"vector-miner: serving {ref} as {kp.ss58_address} to {api_url}: each scene runs on this machine ({cap})",
+          file=sys.stderr)
+    return sv.run(a.api, ref, kp, runner)
 
 
 def cmd_eval(a) -> int:
@@ -340,10 +349,9 @@ def cmd_eval(a) -> int:
         expert = {"image": a.image}
     else:
         raise SystemExit("give --image REF or --command \"...\"")
-    for k in ("step_deadline", "first_step_deadline"):
-        v = getattr(a, k)
-        if v is not None and not (math.isfinite(v) and v > 0):
-            raise SystemExit(f"--{k.replace('_', '-')} must be a positive number of seconds")
+    if a.step_deadline is not None or a.first_step_deadline is not None:
+        print("vector-miner: note: --step-deadline and --first-step-deadline have no effect now: phase 1 runs on your "
+              "machine, and phase 2 limits the expert's time per pick to the wall budget of a pick", file=sys.stderr)
     docker = {k: v for k, v in (("cpus", a.cpus), ("memory", a.memory), ("binary", a.docker)) if v is not None}
     if a.image and a.pull:
         try:
@@ -357,29 +365,28 @@ def cmd_eval(a) -> int:
     n = a.determinism if a.determinism is not None else a.scenes
     if n < 1:
         raise SystemExit("--scenes and --determinism must be at least 1")
-    limits = local.deadlines(a.first_step_deadline, a.step_deadline)
     try:
         r = local.evaluate(expert, n, a.seed, workers=a.workers, time_limit_s=a.time_limit, wall_s=a.wall,
                            docker=docker, stderr_dir=a.stderr, trace_dir=a.trace,
-                           scene_cache_dir=False if a.no_scene_cache else a.scene_cache, limits=limits,
+                           scene_cache_dir=False if a.no_scene_cache else a.scene_cache,
                            again=1 if a.determinism is not None else 0)
     except (AssetsError, EvalError, SceneError, SimError, harness.HarnessError, ValueError) as e:
         print(f"vector-miner: {e}", file=sys.stderr)
         return 2
     if a.determinism is None:
         code = report(r, a.results, "vector-miner")
-        return _deadline_verdict(a, r, code)
-    return _deadline_verdict(a, r, _determinism(a, r, harness))
+        return _time_verdict(a, r, code)
+    return _time_verdict(a, r, _determinism(a, r, harness))
 
 
-def _deadline_verdict(a, r: dict, code: int) -> int:
+def _time_verdict(a, r: dict, code: int) -> int:
     from . import local
     if code == 2:
         return code
-    lat = r["latency"]
-    for line in local.report_lines(lat):
+    et = r["expert_time"]
+    for line in local.report_lines(et):
         print(f"vector-miner: {line}", file=sys.stderr)
-    if a.strict and lat["late_scenes"] and code == 0:
+    if a.strict and et["over"] and code == 0:
         return 1
     return code
 
@@ -397,9 +404,11 @@ def _determinism(a, r: dict, harness) -> int:
         with open(a.results, "w") as f:
             for x in r["results"] + again:
                 f.write(json.dumps(x, separators=(",", ":")) + "\n")
-    out = {"scenes": s["scenes"], "seed": s["seed"], "score": s["score"], "score_again": harness.summary(again)["score"],
+    s2 = harness.summary(again)
+    out = {"scenes": s["scenes"], "seed": s["seed"], "score": s["score"], "score_again": s2["score"],
+           **({"mean_score": s["mean_score"], "mean_score_again": s2.get("mean_score")} if "mean_score" in s else {}),
            "determinism": {k: c[k] for k in ("compared", "equal", "all_equal", "mismatched", "infra")},
-           "deadlines": s.get("deadlines")}
+           "expert_time": s.get("expert_time")}
     print(json.dumps(out))
     if c["all_equal"]:
         print(f"vector-miner: deterministic on {c['compared']} scenes: every action hash matched", file=sys.stderr)
@@ -580,20 +589,23 @@ def main(argv: list[str] | None = None, prog: str = "vector-miner") -> int:
     fp.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     fp.add_argument("--again", action="store_true", help="pay even when an unused payment already exists")
     fp.add_argument("--dev-api", help="a local dev API (no chain): pay there instead")
-    sv = sub.add_parser("serve", parents=[common], help="phase 1: connect to the subnet and run your committed image "
-                                                        "locally on the scenes it sends")
+    sv = sub.add_parser("serve", parents=[common], help="phase 1: connect to the subnet, run each scene it sends on "
+                                                        "this machine (simulator and your committed image), answer "
+                                                        "with its result")
     sv.add_argument("--image", required=True, help="the image you committed (ghcr.io/<you>/<repo>@sha256:<digest>)")
     sv.add_argument("--api", default=api_default)
-    sv.add_argument("--concurrency", type=int, default=8, help="scenes run at once (the server sends up to 8)")
-    sv.add_argument("--warm", type=int, help="containers started ahead, waiting for a scene (default: --concurrency)")
+    sv.add_argument("--concurrency", type=int, help="run at most N scenes at once here (default: as many as the "
+                                                     "server sends, its scenes_at_once, 1 by default)")
+    sv.add_argument("--warm", type=int, help="no effect (each scene starts its own container); kept for old command "
+                                             "lines")
     sv.add_argument("--command", help="run a local program per scene instead of the image (local development)")
     sv.add_argument("--cpus", type=float)
     sv.add_argument("--memory")
     sv.add_argument("--docker", help="the docker binary")
     sv.add_argument("--pull", action="store_true", help="pull the image first when it is not local")
-    sv.add_argument("--stderr", metavar="DIR", help="write each container's stderr to DIR/<container name>.log")
-    e = sub.add_parser("eval", help="local evaluation: random scenes played the way phase 1 plays them, with its "
-                                    "step deadlines")
+    sv.add_argument("--stderr", metavar="DIR", help="write each scene's expert stderr to DIR/<index>-<scene id>.log")
+    e = sub.add_parser("eval", help="local evaluation: random scenes run the way phase 1 runs them on your machine "
+                                    "(vector-env's harness), with the expert's time per pick")
     e.add_argument("--image", help="your image (any local tag or ghcr.io/<you>/<repo>@sha256:<digest>)")
     e.add_argument("--command", help="run a local program instead of the image (while developing)")
     e.add_argument("--scenes", type=int, default=20)
@@ -614,11 +626,10 @@ def main(argv: list[str] | None = None, prog: str = "vector-miner") -> int:
     e.add_argument("--no-scene-cache", action="store_true", help="generate every scene afresh and keep none")
     e.add_argument("--determinism", type=int, metavar="N", help="run N scenes twice and compare every action hash "
                    "(phase 2 needs them equal)")
-    e.add_argument("--first-step-deadline", type=float, metavar="S", help="seconds the expert has to answer start "
-                   "(phase 1: 10)")
-    e.add_argument("--step-deadline", type=float, metavar="S", help="seconds the expert has to answer each later state "
-                   "(phase 1: 2)")
-    e.add_argument("--strict", action="store_true", help="exit 1 when a scene missed a phase-1 deadline")
+    e.add_argument("--first-step-deadline", type=float, metavar="S", help=argparse.SUPPRESS)
+    e.add_argument("--step-deadline", type=float, metavar="S", help=argparse.SUPPRESS)
+    e.add_argument("--strict", action="store_true", help="exit 1 when the expert took longer than the wall budget of "
+                   "a pick in one pick (phase 2 fails that)")
     v = sub.add_parser("verify", help="re-check a final submission: regenerate its scenes from the published salt, "
                                       "check phase 1, phase 2 and the round decision, optionally re-run the image")
     v.add_argument("--submission", help="the submission id (with --image king: the king's, by default)")

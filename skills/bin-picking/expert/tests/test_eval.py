@@ -59,10 +59,10 @@ def test_eval_skips_like_the_round(monkeypatch, capsys):
             raise SceneError("no part in the bin is visible enough to be a target")
         return {"scene_id": f"s{seed}", "seed": seed, "meta": {"parts": [1]}}
     monkeypatch.setattr(scenes, "generate", gen)
-    async def arun(ex, scs, **k):
+    def hrun(ex, scs, **k):
         return [{"scene_id": s["scene_id"], "outcome": "success", "success": True, "t": 3.0, "n": 60, "wall_s": 1.0,
                  "infra": False} for s in scs]
-    monkeypatch.setattr(harness, "arun", arun)
+    monkeypatch.setattr(harness, "run", hrun)
     assert cli.main(["eval", "--command", "true", "--scenes", "3", "--seed", "2"]) == 0
     cap = capsys.readouterr()
     out = json.loads(cap.out)
@@ -85,12 +85,10 @@ def test_eval_passes_trace_and_scene_cache(monkeypatch, capsys, tmp_path):
     assert seen["stderr_dir"] == str(tmp_path / "e") and seen["workers"] == 3
     assert capsys.readouterr().err.strip() == "vector-miner: stop here"
     assert cli.main(["eval", "--command", "true", "--no-scene-cache"]) == 2
-    assert seen["scene_cache_dir"] is False and seen["trace_dir"] is None
-    assert seen["limits"]["first_step_deadline_s"] == 10.0 and seen["limits"]["step_deadline_s"] == 2.0
+    assert seen["scene_cache_dir"] is False and seen["trace_dir"] is None and "limits" not in seen
+    capsys.readouterr()
     assert cli.main(["eval", "--command", "true", "--step-deadline", "0.5", "--first-step-deadline", "3"]) == 2
-    assert seen["limits"] == {"first_step_deadline_s": 3.0, "step_deadline_s": 0.5}
-    with pytest.raises(SystemExit, match="--step-deadline must be a positive"):
-        cli.main(["eval", "--command", "true", "--step-deadline", "0"])
+    assert "have no effect now" in capsys.readouterr().err
 
 
 def _det_run(monkeypatch, hashes):
@@ -98,13 +96,13 @@ def _det_run(monkeypatch, hashes):
     _no_docker_scenes(monkeypatch)
     calls = []
 
-    async def arun(ex, scs, **k):
+    def hrun(ex, scs, **k):
         calls.append([s["scene_id"] for s in scs])
         n = len(calls) - 1
         return [{"scene_id": s["scene_id"], "outcome": hashes[n][s["scene_id"]][1], "success": False, "t": 0.0, "n": 3,
                  "wall_s": 1.0, "infra": hashes[n][s["scene_id"]][1] == "start_failed",
                  "action_hash": hashes[n][s["scene_id"]][0]} for s in scs]
-    monkeypatch.setattr(harness, "arun", arun)
+    monkeypatch.setattr(harness, "run", hrun)
     return calls
 
 
@@ -146,39 +144,35 @@ def test_eval_determinism_on_real_scenes(capsys):
     assert len(out["determinism"]["mismatched"]) == 2
 
 
-def test_the_latency_report_flags_late_acts():
+def test_the_expert_time_report_flags_picks_over_the_wall():
     from vector_miner.skills.bin_picking.expert import local
-    limits = {"first_step_deadline_s": 10.0, "step_deadline_s": 2.0}
-    timing = {"0.0": {"scene_id": "s0", "acts": [3.1, 0.2, 0.4]}, "1.0": {"scene_id": "s1", "acts": [11.0, 0.1]},
-              "2.0": {"scene_id": "s2", "acts": [1.0, 2.5]}, "3.0": {"scene_id": "s3", "acts": [1.0], "pending": 2.4}}
-    res = [{"scene_id": "s3", "outcome": "step_timeout"}]
-    lat = local.latency(timing, res, limits, {"first_act_s": 10.0, "later_acts_s": 2.0})
-    assert lat["first_act_max_s"] == 11.0 and lat["later_act_max_s"] == 2.5 and lat["step_timeouts"] == 1
-    assert lat["late_scenes"] == ["s1", "s2", "s3"] and lat["late_acts"] == 3
-    assert [(x["scene_id"], x["act"]) for x in lat["late"]] == [("s1", 1), ("s2", 2), ("s3", 2)]
-    lines = local.report_lines(lat)
-    assert lines[0].startswith("warning: 3 scenes missed a phase-1 deadline") and "s3 act 2 no answer after 2.4 s" in lines[0]
-    ok = local.latency({"0.0": {"scene_id": "s0", "acts": [3.1, 0.2]}}, [], limits)
-    assert local.report_lines(ok) == ["deadlines met: first act at most 3.1 s (limit 10 s), later acts at most 0.2 s "
-                                      "(limit 2 s)"]
+    res = [{"scene_id": "a", "picks": [{"pick": 0, "expert_s": 3.0}, {"pick": 1, "expert_s": 50.0}]},
+           {"scene_id": "b", "expert_s": 1.0}, {"scene_id": "c", "outcome": "harness_error"}]
+    et = local.expert_time(res, 45.0)
+    assert (et["picks"], et["pick_max_s"], et["pick_mean_s"], et["over_scenes"]) == (3, 50.0, 18.0, ["a"])
+    assert et["over"] == [{"scene_id": "a", "pick": 1, "s": 50.0}]
+    line = local.report_lines(et)[0]
+    assert line.startswith("warning: 1 picks used up the wall budget") and "a pick 1: 50 s" in line
+    ok = local.expert_time(res[1:], 45.0)
+    assert local.report_lines(ok) == ["expert time: at most 1 s in one pick, mean 1 s (the limit in phase 2 is the "
+                                      "wall budget of a pick, 45 s here)"]
+    assert local.report_lines(local.expert_time([], 45.0)) == []
 
 
-def test_eval_enforces_the_phase1_deadlines_on_real_scenes(capsys, tmp_path):
+def test_eval_reports_the_expert_time_on_real_scenes(capsys, tmp_path):
     pytest.importorskip("vector_env")
     from vector_env import assets
     if assets.find() is None:
         pytest.skip(assets.MISSING)
     base = f"{sys.executable} {HERE / 'fake_expert.py'}"
-    argv = ["eval", "--seed", "3", "--scenes", "2", "--workers", "2", "--time-limit", "3"]
+    argv = ["eval", "--seed", "3", "--scenes", "2", "--workers", "2", "--time-limit", "1"]
     assert cli.main([*argv, "--command", f"{base} track 5", "--strict", "--stderr", str(tmp_path / "e")]) == 0
     cap = capsys.readouterr()
     logs = sorted(p.name for p in (tmp_path / "e").iterdir())
     assert len(logs) == 2 and all(x[:5] in ("0000-", "0001-") and x.endswith(".log") for x in logs), logs
-    d = json.loads(cap.out.strip().splitlines()[-1])["deadlines"]
-    assert d["late_scenes"] == [] and d["first_act_max_s"] < 10 and "deadlines met" in cap.err
-    assert cli.main([*argv, "--command", f"{base} lag 5", "--step-deadline", "0.3"]) == 0
+    et = json.loads(cap.out.strip().splitlines()[-1])["expert_time"]
+    assert et["pick_max_s"] < 5 and et["over_scenes"] == [] and "expert time: at most" in cap.err
+    assert cli.main([*argv, "--command", f"{base} lag 2", "--wall", "3"]) == 0
     cap = capsys.readouterr()
-    out = json.loads(cap.out.strip().splitlines()[-1])
-    assert out["outcomes"] == {"step_timeout": 2} and out["deadlines"]["step_timeouts"] == 2, out
-    assert "missed a phase-1 deadline" in cap.err and "--strict" in cap.err
-    assert cli.main([*argv, "--command", f"{base} lag 5", "--step-deadline", "0.3", "--strict"]) == 1
+    assert "used up the wall budget" in cap.err and "--strict" in cap.err, cap.err
+    assert cli.main([*argv, "--command", f"{base} lag 2", "--wall", "3", "--strict"]) == 1

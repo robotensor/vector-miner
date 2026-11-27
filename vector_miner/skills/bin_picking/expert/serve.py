@@ -4,10 +4,9 @@ import asyncio
 import collections
 import datetime as dt
 import json
+import math
 import os
 import random
-import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -25,11 +24,8 @@ from vector_miner.protocol import hello
 from .api import ExpertApi
 
 CONNECT = "/v1/expert/connect"
-MAX_LINE = 1 << 20
-MAX_MESSAGE = 4 << 20
+MAX_MESSAGE = 16 << 20
 OPEN_TIMEOUT_S = 10.0
-END_GRACE_S = 2.0
-IDLE_S = 300.0
 BACKOFF = (1.0, 60.0)
 FATAL_HTTP = (400, 401, 403, 404, 410)
 BUSY_WAIT_S = 60.0
@@ -113,200 +109,209 @@ def _wait_text(s: float) -> str:
     return f"{s:.1f} s"
 
 
-class Launcher:
-    def __init__(self, expert: dict, docker: dict | None = None, bundle: Path | None = None,
-                 stderr_dir: str | Path | None = None, by_scene: bool = False):
-        if not expert.get("command") and not expert.get("image"):
-            raise ServeError("the expert needs an image or a command")
-        self.expert, self.docker, self.bundle = expert, docker, bundle
-        self.stderr_dir = Path(stderr_dir) if stderr_dir else None
-        self.by_scene = by_scene
-        if self.stderr_dir:
-            self.stderr_dir.mkdir(parents=True, exist_ok=True)
+def _signed(v) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
 
-    def spec(self) -> dict:
-        name = f"vector-miner-{uuid.uuid4().hex[:12]}"
-        if self.expert.get("command"):
-            cmd = self.expert["command"]
-            argv = shlex.split(cmd) if isinstance(cmd, str) else [str(x) for x in cmd]
-            env = dict(os.environ)
-            if self.bundle is not None:
-                env["VECTOR_SIM_BUNDLE"] = str(self.bundle)
-            return {"name": name, "argv": argv, "kill": None, "env": env, "cwd": str(self.expert.get("cwd") or Path.cwd())}
-        from vector_env import harness
-        argv, kill = harness.docker_argv(str(self.expert["image"]), name, self.docker, self.bundle)
-        return {"name": name, "argv": argv, "kill": kill, "env": None, "cwd": None}
 
-    def label(self, ex: "Expert", key: str, start: dict) -> None:
-        if not (self.stderr_dir and self.by_scene):
-            return
+def _sc(v) -> str:
+    x = _signed(v)
+    if x is None:
+        return "null"
+    x = round(x, 3)
+    return "0.000" if x == 0 else f"{x:+.3f}"
+
+
+CHILD = ("import sys; from vector_miner.skills.bin_picking.expert.serve import child; sys.exit(child())")
+
+
+def play(job: dict) -> dict:
+    """Runs one scene with vector-env's harness on this machine (the simulator and the expert) and returns
+    `{"result": <the claim>, "errors": <check_claim's lines>}`. job: {expert, scene, limits, docker, stderr_dir,
+    index}."""
+    from vector_env import assets, harness
+    from vector_env.settings import env_config
+    sc, lim = job["scene"], job["limits"]
+    t0 = time.monotonic()
+    try:
+        bundle = assets.for_scene(sc) if hasattr(assets, "for_scene") else None
+        wall = float(lim.get("wall_s") or env_config()["harness"]["wall_s"])
+        r = harness.run(job["expert"], [sc], time_limit_s=float(lim["time_limit_s"]), wall_s=wall,
+                        docker=job.get("docker"), stderr_dir=job.get("stderr_dir"), bundle=bundle)[0]
+    except Exception as e:
+        r = failed(sc, f"{type(e).__name__}: {e}"[:500], time.monotonic() - t0)
+    d = job.get("stderr_dir")
+    if d:
         try:
-            idx = int(str(key).split(".")[0])
-        except ValueError:
-            return
-        sid = re.sub(r"[^A-Za-z0-9._-]", "_", str((start.get("scene") or {}).get("scene_id") or "scene"))[:120]
-        try:
-            os.replace(self.stderr_dir / f"{ex.name}.log", self.stderr_dir / f"{idx:04d}-{sid}.log")
+            os.replace(harness.stderr_path(d, 0, sc), harness.stderr_path(d, int(job.get("index") or 0), sc))
         except OSError:
             pass
-
-    def discard(self, ex: "Expert") -> None:
-        if self.stderr_dir and self.by_scene:
-            try:
-                (self.stderr_dir / f"{ex.name}.log").unlink()
-            except OSError:
-                pass
-
-    async def spawn(self) -> Expert:
-        sp = self.spec()
-        err = open(self.stderr_dir / f"{sp['name']}.log", "wb") if self.stderr_dir else subprocess.DEVNULL
-        try:
-            proc = await asyncio.create_subprocess_exec(*sp["argv"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                                        stderr=err, env=sp["env"], cwd=sp["cwd"], limit=MAX_LINE + 2,
-                                                        start_new_session=True)
-        finally:
-            if err is not subprocess.DEVNULL:
-                err.close()
-        return Expert(sp, proc)
+    claim = harness.wire_result(r, lim)
+    return {"result": claim, "errors": harness.check_claim(sc, claim, lim)}
 
 
-class Expert:
-    def __init__(self, spec: dict, proc: asyncio.subprocess.Process):
-        self.spec, self.proc, self.stopped = spec, proc, False
+def failed(sc: dict, error: str, wall: float = 0.0) -> dict:
+    """A scene this machine could not run (no bundle, a broken vector-env): an infra result with no rows."""
+    return {"scene_id": sc.get("scene_id"), "outcome": "harness_error", "success": False, "error": error, "infra": True,
+            "ctrl": "", "n": 0, "act_rows": [], "dropped_ctrl": "", "action_hash": None, "rows_sent": 0, "t": 0.0,
+            "tick": 0, "outs": 0, "out_parts": [], "tcp_path_m": 0.0, "joint_path_rad": 0.0, "crate_hits": 0,
+            "target_class": sc.get("target_class"), "score": None, "expert_s": 0.0, "wall_s": round(wall, 3)}
+
+
+def child() -> int:
+    """The process of one scene: a job (JSON) on stdin, `play`'s answer (one JSON line) on stdout."""
+    job = json.loads(sys.stdin.buffer.read())
+    out = play(job)
+    sys.stdout.write(json.dumps(out, separators=(",", ":"), allow_nan=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def _summary(r: dict) -> str:
+    o = r.get("outcome")
+    if isinstance(r.get("picks"), list):
+        bits = f"{r.get('successes', 0)}/{r.get('picks_planned') or len(r['picks'])} picks, {r.get('outs', 0)} out"
+        return f"{o} ({bits}, t={r.get('t')} s, expert {r.get('expert_s')} s)"
+    return f"{o} t={r.get('t')} s, expert {r.get('expert_s')} s"
+
+
+class Runner:
+    """Phase 1 on this machine: runs every scene the server sends (one process per scene: vector-env's harness, the
+    simulator and the expert's container), checks its claim with vector-env's check_claim and answers with it. Runs
+    and answers outlive a connection: after a reconnect the answers not yet acknowledged are sent again, and a scene
+    sent again is not run again."""
+
+    def __init__(self, expert: dict, docker: dict | None = None, stderr_dir: str | Path | None = None,
+                 cap: int | None = None, log=_log, argv: list[str] | None = None):
+        if not expert.get("command") and not expert.get("image"):
+            raise ServeError("the expert needs an image or a command")
+        self.expert, self.log = expert, log
+        self.argv = list(argv) if argv else [sys.executable, "-c", CHILD]
+        self.tag = f"vector-miner-{uuid.uuid4().hex[:12]}"
+        self.docker = dict(docker or {})
+        if expert.get("image") and not expert.get("command"):
+            self.docker["args"] = [*(self.docker.get("args") or []), "--label", f"vector-miner.serve={self.tag}"]
+        self.stderr_dir = str(stderr_dir) if stderr_dir else None
+        if self.stderr_dir:
+            Path(self.stderr_dir).mkdir(parents=True, exist_ok=True)
+        self.sem = asyncio.Semaphore(int(cap)) if cap else None
+        self.cap = int(cap) if cap else None
+        self.tasks: dict[int, asyncio.Task] = {}
+        self.procs: dict[int, asyncio.subprocess.Process] = {}
+        self.ids: dict[int, object] = {}
+        self.claims: dict[int, dict] = {}
+        self.unacked: set[int] = set()
+        self.acks: dict[int, dict] = {}
+        self.out: asyncio.Queue | None = None
+        self.outcomes: collections.Counter = collections.Counter()
+        self.total: int | None = None
+        self.server_done: int = 0
+        self.done: dict | None = None
+        self.failed_checks = 0
+        self.closed = False
 
     @property
-    def name(self) -> str:
-        return self.spec["name"]
+    def answered(self) -> int:
+        return len(self.claims)
 
-    def alive(self) -> bool:
-        return self.proc.returncode is None
+    def claimed(self) -> float | None:
+        xs = [c["score"] for c in self.claims.values() if _signed(c.get("score")) is not None]
+        return sum(xs) / len(xs) if xs else None
 
-    async def write(self, msg: dict) -> bool:
-        try:
-            self.proc.stdin.write((json.dumps(msg, separators=(",", ":")) + "\n").encode())
-            await self.proc.stdin.drain()
-            return True
-        except (BrokenPipeError, ConnectionResetError, RuntimeError, AttributeError):
-            return False
+    def progress(self) -> str:
+        tot = self.total if self.total is not None else "?"
+        line = f"{self.server_done + self.answered}/{tot} scenes answered" if self.total is not None else \
+            f"{self.answered} scenes answered here"
+        acc = sum(1 for a in self.acks.values() if a.get("ok"))
+        rej = sum(1 for a in self.acks.values() if a.get("ok") is False)
+        line += f", claimed score {_sc(self.claimed())} over {self.answered} here"
+        if self.acks:
+            line += f" ({acc} accepted, {rej} rejected)"
+        return line
 
-    async def readline(self) -> bytes | None:
-        try:
-            line = await self.proc.stdout.readline()
-        except ValueError:
-            raise ServeError(f"the expert wrote a line longer than {MAX_LINE} bytes") from None
-        return line or None
-
-    async def stop(self, grace: float = END_GRACE_S) -> None:
-        if self.stopped:
+    async def on_scene(self, m: dict) -> None:
+        idx, sc, lim = m.get("index"), m.get("scene"), m.get("limits")
+        if not (isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0 and isinstance(sc, dict)
+                and isinstance(lim, dict)):
+            self.log(f"ignored a scene message without index, scene and limits: {str(m)[:200]}")
             return
-        self.stopped = True
+        sid = sc.get("scene_id")
+        if self.ids.get(idx) == sid and (idx in self.claims or idx in self.tasks):
+            if idx in self.claims:
+                self.unacked.add(idx)
+                self._push(idx)
+            return
+        self.ids[idx] = sid
+        self.claims.pop(idx, None)
+        self.unacked.discard(idx)
+        self.acks.pop(idx, None)
+        self.log(f"scene {idx} ({sid}): running here")
+        self.tasks[idx] = asyncio.ensure_future(self._run(idx, sc, lim))
+
+    async def _run(self, idx: int, sc: dict, lim: dict) -> None:
         try:
-            if self.proc.stdin and not self.proc.stdin.is_closing():
-                self.proc.stdin.close()
-        except (BrokenPipeError, ConnectionResetError, RuntimeError):
-            pass
-        if grace > 0 and self.alive():
-            try:
-                await asyncio.wait_for(self.proc.wait(), grace)
-            except asyncio.TimeoutError:
-                pass
-        if self.alive():
-            await self._kill()
+            if self.sem is not None:
+                async with self.sem:
+                    got = await self._child(idx, sc, lim)
+            else:
+                got = await self._child(idx, sc, lim)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            got = {"result": failed(sc, f"serve could not run the scene: {type(e).__name__}: {e}"[:500]), "errors": []}
+        finally:
+            self.tasks.pop(idx, None)
+        if self.ids.get(idx) != sc.get("scene_id"):
+            return
+        r, errs = got["result"], got.get("errors") or []
+        self.claims[idx] = r
+        self.unacked.add(idx)
+        self.outcomes[str(r.get("outcome"))] += 1
+        self.log(f"scene {idx} ({sc.get('scene_id')}): {_summary(r)}, claimed score {_sc(r.get('score'))}"
+                 + (f" ({r['error']})" if r.get("error") else "") + f"  [{self.progress()}]")
+        if errs:
+            self.failed_checks += 1
+            self.log(f"warning: scene {idx}: this claim fails the subnet's check (it scores 0): " + "; ".join(errs[:3]))
+        self._push(idx)
+
+    async def _child(self, idx: int, sc: dict, lim: dict) -> dict:
+        job = {"expert": self.expert, "scene": sc, "limits": lim, "docker": self.docker, "stderr_dir": self.stderr_dir,
+               "index": idx}
+        p = await asyncio.create_subprocess_exec(*self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                 stderr=subprocess.PIPE, start_new_session=True, limit=MAX_MESSAGE)
+        self.procs[idx] = p
         try:
-            await asyncio.wait_for(self.proc.wait(), 30)
-        except asyncio.TimeoutError:
-            pass
+            out, err = await p.communicate(json.dumps(job, separators=(",", ":")).encode())
+        finally:
+            self.procs.pop(idx, None)
+        if p.returncode != 0:
+            tail = err.decode(errors="replace").strip()[-300:]
+            raise ServeError(f"the scene's process exited {p.returncode}" + (f": {tail}" if tail else ""))
+        return json.loads(out)
 
-    async def _kill(self) -> None:
-        if self.spec.get("kill"):
-            try:
-                k = await asyncio.create_subprocess_exec(*self.spec["kill"], stdout=subprocess.DEVNULL,
-                                                         stderr=subprocess.DEVNULL)
-                await asyncio.wait_for(k.wait(), 30)
-            except (OSError, asyncio.TimeoutError):
-                pass
-        try:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                self.proc.kill()
-            except ProcessLookupError:
-                pass
+    def running(self) -> int:
+        return len(self.tasks)
 
+    def _push(self, idx: int) -> None:
+        if self.out is not None and idx in self.claims:
+            self.out.put_nowait({"type": "result", "index": idx, "result": self.claims[idx]})
 
-class Warm:
-    def __init__(self, launcher: Launcher, size: int):
-        self.launcher, self.size = launcher, max(0, int(size))
-        self.ready: collections.deque[Expert] = collections.deque()
-        self.filling: asyncio.Task | None = None
-        self.closed = False
-        self.spawned = 0
-
-    async def _spawn(self) -> Expert:
-        self.spawned += 1
-        return await self.launcher.spawn()
-
-    async def fill(self) -> None:
-        while not self.closed and len(self.ready) < self.size:
-            e = await self._spawn()
-            if self.closed:
-                await e.stop(0)
-                return
-            self.ready.append(e)
-
-    def _refill(self) -> None:
-        if self.size and not self.closed and (self.filling is None or self.filling.done()):
-            self.filling = asyncio.ensure_future(self.fill())
-
-    async def take(self) -> Expert:
-        while self.ready:
-            e = self.ready.popleft()
-            if e.alive():
-                self._refill()
-                return e
-            await e.stop(0)
-        self._refill()
-        return await self._spawn()
-
-    async def close(self) -> None:
-        self.closed = True
-        if self.filling is not None:
-            try:
-                await self.filling
-            except Exception:
-                pass
-        while self.ready:
-            e = self.ready.popleft()
-            await e.stop(0)
-            self.launcher.discard(e)
-
-
-def _plain(msg: dict) -> dict:
-    return {k: v for k, v in msg.items() if k != "scene_key"}
-
-
-class Bridge:
-    def __init__(self, spare: Warm, concurrency: int, log=_log, idle_s: float = IDLE_S, timing: bool = False):
-        self.spare, self.log, self.idle_s = spare, log, idle_s
-        self.timing: dict[str, dict] | None = {} if timing else None
-        self.concurrency = max(1, int(concurrency))
-        self.sem = asyncio.Semaphore(self.concurrency)
-        self.refused = 0
-        self.ended = 0
-        self.outcomes: collections.Counter = collections.Counter()
-        self.experts: dict[str, Expert] = {}
-        self.stopping: set[asyncio.Task] = set()
-        self.done: dict | None = None
+    def on_ack(self, m: dict) -> None:
+        idx = m.get("index")
+        if idx not in self.claims:
+            return
+        self.unacked.discard(idx)
+        self.acks[idx] = m
+        if m.get("ok") is False:
+            self.log(f"scene {idx}: the server rejected this answer (the scene scores 0): {m.get('reason') or 'no reason given'}")
 
     async def connection(self, ws, on_message=None) -> str:
         out: asyncio.Queue = asyncio.Queue()
-        scenes: dict[str, tuple[asyncio.Queue, asyncio.Task]] = {}
-        ended: set[str] = set()
+        self.out = out
 
         async def writer() -> None:
             while True:
                 m = await out.get()
-                await ws.send(json.dumps(m, separators=(",", ":")))
+                await ws.send(json.dumps(m, separators=(",", ":"), allow_nan=False))
 
         w = asyncio.ensure_future(writer())
         try:
@@ -325,148 +330,78 @@ class Bridge:
                     continue
                 if on_message:
                     on_message(m)
-                t, key = m.get("type"), m.get("scene_key")
-                if isinstance(key, str) and t == "start":
-                    for k in [k for k, (_, task) in scenes.items() if task.done()]:
-                        scenes.pop(k, None)
-                        ended.discard(k)
-                    if key in scenes:
-                        continue
-                    idx = key.split(".")[0]
-                    for k in [k for k in scenes if k.split(".")[0] == idx]:
-                        scenes.pop(k)[1].cancel()
-                        ended.discard(k)
-                    if sum(1 for k in scenes if k not in ended) >= self.concurrency:
-                        self.refused += 1
-                        out.put_nowait({"type": "error", "scene_key": key,
-                                        "error": f"this miner runs at most {self.concurrency} scenes at once "
-                                                 f"(vector-miner serve --concurrency {self.concurrency})"})
-                        if self.refused in (1, 10, 100) or self.refused % 1000 == 0:
-                            self.log(f"refused scene {key}: {self.concurrency} scenes already run "
-                                     f"({self.refused} refused so far; raise --concurrency)")
-                        continue
-                    q: asyncio.Queue = asyncio.Queue()
-                    scenes[key] = (q, asyncio.ensure_future(self.scene(key, m, q, out, time.monotonic())))
-                elif isinstance(key, str) and t in ("state", "end"):
-                    if key in scenes and not scenes[key][1].done():
-                        scenes[key][0].put_nowait(m)
-                        if t == "end":
-                            ended.add(key)
+                t = m.get("type")
+                if t == "scene":
+                    await self.on_scene(m)
+                elif t == "ack":
+                    self.on_ack(m)
+                elif t == "welcome":
+                    self.log(_welcome(m))
+                    total, done_n = m.get("scenes", m.get("total")), m.get("done")
+                    if isinstance(total, int) and not isinstance(total, bool):
+                        self.total = total
+                    want = _num(m.get("scenes_at_once"))
+                    if want is not None and self.cap is not None and want > self.cap:
+                        self.log(f"warning: the server sends {want:g} scenes at once and --concurrency caps this miner "
+                                 f"at {self.cap}: the extra scenes wait here and may miss their deadline")
+                    for idx in sorted(self.unacked):
+                        self._push(idx)
+                    if self.unacked:
+                        self.log(f"sent {len(self.unacked)} answers again that the server had not acknowledged")
+                    if isinstance(done_n, int) and not isinstance(done_n, bool):
+                        self.server_done = max(0, done_n - len(self.claims))
                 elif t == "done":
                     self.done = m
                     return "done"
-                elif t == "welcome":
-                    self.log(_welcome(m))
-                    want = _num(m.get("concurrency"))
-                    if want is not None and want > self.concurrency:
-                        self.log(f"warning: the server runs {want:g} scenes at once and this miner {self.concurrency}: "
-                                 f"start serve with --concurrency {want:g} or the extra scenes fail")
-                elif t == "error" and key is None:
-                    self.log(f"the server says: {_says(m)}")
+                elif t == "error":
+                    if m.get("index") is not None:
+                        self.log(f"scene {m.get('index')}: the server says: {_says(m)}")
+                    else:
+                        self.log(f"the server says: {_says(m)}")
         finally:
+            self.out = None
             w.cancel()
-            tasks = [t for _, t in scenes.values() if not t.done()]
-            for t in tasks:
-                t.cancel()
-            for t in tasks:
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
             try:
                 await w
             except (asyncio.CancelledError, Exception):
                 pass
 
-    async def scene(self, key: str, start: dict, inbox: asyncio.Queue, out: asyncio.Queue,
-                    got_at: float | None = None) -> None:
-        clock = {"sent": got_at if got_at is not None else time.monotonic()}
-        acts: list[float] = []
-        if self.timing is not None:
-            self.timing[key] = {"scene_id": (start.get("scene") or {}).get("scene_id"), "acts": acts}
-        async with self.sem:
-            t = asyncio.ensure_future(self.spare.take())
+    async def close(self) -> None:
+        """Stops every run: kills each scene's process group and the containers this miner started."""
+        self.closed = True
+        for t in list(self.tasks.values()):
+            t.cancel()
+        if self.expert.get("image") and not self.expert.get("command"):
+            await _kill_labelled(str(self.docker.get("binary") or "docker"), f"vector-miner.serve={self.tag}")
+        for p in list(self.procs.values()):
             try:
-                ex = await asyncio.shield(t)
-            except asyncio.CancelledError:
-                try:
-                    await (await t).stop(0)
-                except Exception:
-                    pass
-                raise
-            self.experts[key] = ex
-            self.spare.launcher.label(ex, key, start)
-            state = {"ended": False}
-
-            async def pump() -> None:
-                try:
-                    while True:
-                        line = await ex.readline()
-                        if line is None:
-                            break
-                        if not line.strip():
-                            continue
-                        if clock["sent"] is not None:
-                            acts.append(time.monotonic() - clock["sent"])
-                            clock["sent"] = None
-                        try:
-                            m = json.loads(line)
-                        except (ValueError, RecursionError):
-                            m = None
-                        if not isinstance(m, dict):
-                            out.put_nowait({"type": "error", "scene_key": key,
-                                            "error": "the expert wrote a line that is not a JSON object"})
-                            return
-                        m["scene_key"] = key
-                        out.put_nowait(m)
-                except ServeError as e:
-                    out.put_nowait({"type": "error", "scene_key": key, "error": str(e)})
-                    return
-                if not state["ended"]:
-                    rc = await ex.proc.wait()
-                    if not state["ended"]:
-                        out.put_nowait({"type": "error", "scene_key": key,
-                                        "error": f"the expert exited (code {rc}) before the scene ended"})
-
-            p = asyncio.ensure_future(pump())
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        for t in list(self.tasks.values()):
             try:
-                await ex.write(_plain(start))
-                while True:
-                    try:
-                        m = await asyncio.wait_for(inbox.get(), self.idle_s)
-                    except asyncio.TimeoutError:
-                        self.log(f"scene {key}: no message from the server for {self.idle_s:g} s; stopping it")
-                        break
-                    if m.get("type") == "end":
-                        state["ended"] = True
-                        if self.timing is not None and clock["sent"] is not None:
-                            self.timing[key]["pending"] = time.monotonic() - clock["sent"]
-                        await ex.write(_plain(m))
-                        self.ended += 1
-                        self.outcomes[str(m.get("outcome"))] += 1
-                        self.log(f"scene {key}: {m.get('outcome')} t={m.get('t')}"
-                                 + (f" ({m['error']})" if m.get("error") else "") + f"  [{self.ended} ended]")
-                        break
-                    clock["sent"] = time.monotonic()
-                    await ex.write(_plain(m))
-            finally:
-                ok = state["ended"]
-                state["ended"] = True
-                p.cancel()
-                try:
-                    await p
-                except (asyncio.CancelledError, Exception):
-                    pass
-                self.experts.pop(key, None)
-                st = asyncio.ensure_future(ex.stop(END_GRACE_S if ok else 0))
-                self.stopping.add(st)
-                st.add_done_callback(self.stopping.discard)
-                await asyncio.shield(st)
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        for p in list(self.procs.values()):
+            try:
+                await asyncio.wait_for(p.wait(), 10)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
-    async def drain(self) -> None:
-        while self.stopping:
-            await asyncio.gather(*list(self.stopping), return_exceptions=True)
 
+async def _kill_labelled(binary: str, label: str) -> None:
+    try:
+        p = await asyncio.create_subprocess_exec(binary, "ps", "-q", "--filter", f"label={label}",
+                                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(p.communicate(), 30)
+        ids = out.decode().split()
+        if ids:
+            k = await asyncio.create_subprocess_exec(binary, "kill", *ids, stdout=subprocess.DEVNULL,
+                                                     stderr=subprocess.DEVNULL)
+            await asyncio.wait_for(k.wait(), 30)
+    except (OSError, asyncio.TimeoutError):
+        pass
 
 def _welcome(m: dict) -> str:
     line = "connected"
@@ -477,10 +412,11 @@ def _welcome(m: dict) -> str:
     total = m.get("scenes", m.get("total"))
     if m.get("done") is not None or total is not None:
         line += f", {m.get('done') if m.get('done') is not None else '?'}/{total if total is not None else '?'} scenes done"
-    first, step = _num(m.get("first_step_deadline_s")), _num(m.get("step_deadline_s"))
-    if first is not None or step is not None:
-        line += "; deadlines:" + (f" first act {first:g} s" if first is not None else "") + \
-                (("," if first is not None else "") + f" each later act {step:g} s" if step is not None else "")
+    conc, dl = _num(m.get("scenes_at_once")), _num(m.get("scene_deadline_s"))
+    if conc is not None:
+        line += f"; the server sends {conc:g} scene{'s' if conc != 1 else ''} at a time"
+    if dl is not None:
+        line += f"; each scene must be answered within {_wait_text(dl)}"
     return line
 
 
@@ -488,10 +424,10 @@ def _done(m: dict) -> str:
     line = "the server says phase 1 is finished"
     if m.get("status") is not None:
         line += f": status {m['status']}"
-    if m.get("score") is not None:
-        line += f", score {m['score']}"
+    if _signed(m.get("score")) is not None:
+        line += f", score {_sc(m['score'])}"
         if m.get("successes") is not None and m.get("scenes") is not None:
-            line += f" ({m['successes']}/{m['scenes']})"
+            line += f" ({m['successes']}/{m['scenes']} successes)"
     if m.get("detail"):
         line += f" ({m['detail']})"
     return line
@@ -504,16 +440,13 @@ async def _sleep_or_stop(stop: asyncio.Event, s: float) -> None:
         pass
 
 
-async def serve(api: str, image: str, keypair, launcher: Launcher, *, concurrency: int = 8, warm: int | None = None,
-                stop: asyncio.Event | None = None, backoff: tuple[float, float] = BACKOFF, log=_log,
-                max_attempts: int | None = None, idle_s: float = IDLE_S) -> int:
+async def serve(api: str, image: str, keypair, runner: Runner, *, stop: asyncio.Event | None = None,
+                backoff: tuple[float, float] = BACKOFF, log=_log, max_attempts: int | None = None) -> int:
     url = ws_url(api)
     stop = stop or asyncio.Event()
-    spare = Warm(launcher, concurrency if warm is None else warm)
-    bridge = Bridge(spare, concurrency, log, idle_s)
+    runner.log = log
     delay, attempts, nonce_refusals = backoff[0], 0, 0
     try:
-        await spare.fill()
         while not stop.is_set():
             attempts += 1
             accepted = {"ok": False, "error": None}
@@ -521,7 +454,7 @@ async def serve(api: str, image: str, keypair, launcher: Launcher, *, concurrenc
             def seen(m: dict) -> None:
                 if m.get("type") == "welcome":
                     accepted["ok"] = True
-                elif m.get("type") == "error" and m.get("scene_key") is None:
+                elif m.get("type") == "error" and m.get("index") is None:
                     accepted["error"] = m
 
             why, wait = None, None
@@ -530,19 +463,19 @@ async def serve(api: str, image: str, keypair, launcher: Launcher, *, concurrenc
                 async with ws_connect(url, max_size=MAX_MESSAGE, open_timeout=OPEN_TIMEOUT_S, ping_interval=20,
                                       ping_timeout=20, close_timeout=5) as ws:
                     await ws.send(json.dumps(hello(keypair, image, nonce), separators=(",", ":")))
-                    run = asyncio.ensure_future(bridge.connection(ws, seen))
+                    run = asyncio.ensure_future(runner.connection(ws, seen))
                     halt = asyncio.ensure_future(stop.wait())
                     done, _ = await asyncio.wait({run, halt}, return_when=asyncio.FIRST_COMPLETED)
                     if run in done:
                         halt.cancel()
                         if run.result() == "done":
                             await ws.close(1000, "phase 1 finished")
-                            m = bridge.done or {}
+                            m = runner.done or {}
                             log(_done(m))
                             r = refusal(4403, "", {"reason": "not_open", "retry_at": m.get("retry_at")}) \
                                 if m.get("status") == "review" else None
                             if r is None or r["final"]:
-                                log(f"done: {bridge.ended} scenes ended here ({_counts(bridge)})")
+                                log(f"done: {runner.answered} scenes answered here ({_counts(runner)})")
                                 return 0
                             wait = r["wait_s"]
                             why = (f"scenes failed on the server's side and phase 1 runs again from {r['retry_at']}; "
@@ -600,21 +533,23 @@ async def serve(api: str, image: str, keypair, launcher: Launcher, *, concurrenc
                 await _sleep_or_stop(stop, wait)
                 continue
             wait = min(backoff[1], delay) * (0.5 + random.random() / 2)
-            log(f"{why}; reconnecting in {wait:.1f} s (unfinished scenes resume on the server)")
+            running = runner.running()
+            log(f"{why}; reconnecting in {wait:.1f} s" + (f" ({running} scenes keep running here; their answers are "
+                                                          "sent after the reconnect)" if running else ""))
             await _sleep_or_stop(stop, wait)
             delay = min(backoff[1], delay * 2)
-        log(f"stopped: {bridge.ended} scenes ended here ({_counts(bridge)})")
+        log(f"stopped: {runner.answered} scenes answered here ({_counts(runner)})")
         return 0
     finally:
-        await bridge.drain()
-        await spare.close()
+        await runner.close()
 
 
-def _counts(b: Bridge) -> str:
-    return ", ".join(f"{k} {v}" for k, v in sorted(b.outcomes.items())) or "none"
+def _counts(r: Runner) -> str:
+    bits = ", ".join(f"{k} {v}" for k, v in sorted(r.outcomes.items())) or "none"
+    return f"{bits}; claimed score {_sc(r.claimed())}"
 
 
-def run(api: str, image: str, keypair, launcher: Launcher, **kw) -> int:
+def run(api: str, image: str, keypair, runner: Runner, **kw) -> int:
     async def main() -> int:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -623,6 +558,6 @@ def run(api: str, image: str, keypair, launcher: Launcher, **kw) -> int:
                 loop.add_signal_handler(s, stop.set)
             except (NotImplementedError, RuntimeError):
                 pass
-        return await serve(api, image, keypair, launcher, stop=stop, **kw)
+        return await serve(api, image, keypair, runner, stop=stop, **kw)
 
     return asyncio.run(main())
