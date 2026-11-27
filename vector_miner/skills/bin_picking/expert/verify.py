@@ -158,6 +158,16 @@ def _draw(e: SimpleNamespace, seed0: int, tries: int, draw) -> tuple[dict | None
     return None, why
 
 
+def _without_bury(e: SimpleNamespace, seed: int, draw) -> tuple[dict | None, str | None]:
+    """A scene the subnet made again from the same seed without the bury (its row says `bury: false`)."""
+    try:
+        st = dict(e.scenes.settings_for(int(seed), draw))
+        st.pop("bury", None)
+        return e.scenes.generate(int(seed), draw, settings=st), None
+    except Exception as ex:
+        return None, f"{type(ex).__name__}: {ex}"[:500]
+
+
 def _generator_works(e: SimpleNamespace, rows: dict, failed: set, draw) -> tuple[bool, str | None]:
     probe = next((x for i, x in sorted(rows.items()) if i not in failed), None)
     if probe is None:
@@ -191,7 +201,10 @@ def regenerate(doc: dict, e: SimpleNamespace, indexes: list[int], log=_log, loca
     for j, i in enumerate(indexes):
         x = rows[i]
         want = x.get("env") or top
-        sc, why = _draw(e, base_seed(salt, n, i), tries, draw)
+        if x.get("bury") is False:
+            sc, why = _without_bury(e, x["seed"], draw)
+        else:
+            sc, why = _draw(e, base_seed(salt, n, i), tries, draw)
         row = {"index": i, "seed": x["seed"], "state_hash": x["state_hash"]}
         if sc is None:
             failed.add(i)

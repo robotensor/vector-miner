@@ -708,7 +708,7 @@ def test_the_phase2_sample_seed_and_the_expert_time_per_pick(capsys, env, tmp_pa
     rows, res = doc["scenes"], doc["phase1"]["results"]
     ok = [x["index"] for x in rows]
     h = "0x" + "ab" * 32
-    seed = hashlib.sha256(f"{h}:phase2:{SID}".encode()).hexdigest()
+    seed = h
     pick = sorted(sorted(ok, key=lambda i: hashlib.sha256(f"{seed}:phase2:{i}".encode()).hexdigest())[:6])
     pos = {x["index"]: k for k, x in enumerate(rows)}
     doc["phase2"].update(scenes=pick, outcome=[res["outcome"][pos[i]] for i in pick],
@@ -725,4 +725,4 @@ def test_the_phase2_sample_seed_and_the_expert_time_per_pick(capsys, env, tmp_pa
     doc["phase2"]["pick_expert_s"] = [[1.0, 2.0]] * 6
     doc["phase2"]["sample_seed"] = {**doc["phase2"]["sample_seed"], "seed": "f" * 64}
     code, probs, out = problems(capsys, tmp_path, doc)
-    assert any("sample seed is not sha256" in p for p in probs), probs
+    assert any("sample seed is not the hash of block" in p for p in probs), probs

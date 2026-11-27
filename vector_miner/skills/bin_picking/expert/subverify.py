@@ -394,6 +394,80 @@ def _scene_scores(name: str, part: dict, count: int, formula: dict, time_limit_s
     return bad
 
 
+AUDIT_KEYS = ("action_hash", "target", "outcome", "tick", "outs")
+
+
+def same_pick(claimed: dict, rerun: dict) -> bool:
+    """A claimed pick is what the re-run of the image did: same actions, target, outcome, ticks, outs and parts out."""
+    if any(claimed.get(k) != rerun.get(k) for k in AUDIT_KEYS):
+        return False
+    return sorted(claimed.get("out_parts") or []) == sorted(rerun.get("out_parts") or [])
+
+
+def audit_scene(claimed: list, rerun: list, *, cut: bool, fake: float, out_unit: float, planned: int) -> dict:
+    """The audited scene's score (the subnet's rule): claimed and re-run picks compared in order; the first claimed
+    pick that differs scores `fake`; every other pick scores the re-run's gain (its `score`); a cut-off claim is
+    compared up to its open pick; the outs penalty is the re-run's. Returns {score, faked}."""
+    cp = [p for p in (claimed or []) if isinstance(p, dict)]
+    rp = [p for p in (rerun or []) if isinstance(p, dict)]
+    stop = len(cp) - 1 if cut and cp else len(cp)
+    faked, gains = None, []
+    for k, r in enumerate(rp):
+        if faked is None and k < stop and not same_pick(cp[k], r):
+            faked = k
+            gains.append(float(fake))
+            continue
+        gains.append(float(r.get("score") or 0.0))
+    if faked is None and not cut and len(cp) != len(rp):
+        faked = min(len(cp), len(rp))
+        if faked < len(gains):
+            gains[faked] = float(fake)
+        else:
+            gains.append(float(fake))
+    outs = sum(max(0, int(p.get("outs") or 0)) for p in rp)
+    n = max(1, int(planned or 0) or len(gains), len(gains))
+    return {"score": round((math.fsum(gains) - out_unit * (2 ** min(outs, OUTS_CAP) - 1)) / n, 6), "faked": faked}
+
+
+def _audit(doc: dict, p2: dict, pos: dict) -> tuple[list, list[str]]:
+    """Recompute every audited scene from the published claim and re-run picks: (faked scene indexes, problems)."""
+    res = doc["phase1"]["results"]
+    picks1 = res.get("picks") if isinstance(res.get("picks"), list) else []
+    outc = res.get("outcome") or []
+    formula = doc.get("score_formula") or {}
+    unit = float(formula.get("out_unit", 1.0) or 0.0)
+    planned = _n_picks(doc.get("task") or {}, formula) or int(doc.get("picks") or 0)
+    fake = float(p2.get("fake_pick_score", -1.0))
+    pub = p2.get("audited") or {}
+    faked, bad, scores = [], [], {}
+    for j, i in enumerate(p2.get("scenes") or []):
+        if i not in pos or str(i) not in pub:
+            continue
+        k = pos[i]
+        rp = (p2.get("picks") or [None] * (j + 1))[j] if j < len(p2.get("picks") or []) else None
+        if rp is None:
+            continue
+        cut = k < len(outc) and outc[k] in CUT_OFF
+        a = audit_scene(picks1[k] if k < len(picks1) else [], rp, cut=cut, fake=fake, out_unit=unit, planned=planned)
+        got = pub[str(i)]
+        if a["faked"] != got.get("faked") or not _close(got.get("score"), a["score"], SCORE_TOL):
+            bad.append(f"phase 2: audited scene {i} gives score {a['score']} (faked pick {a['faked']}), the document "
+                       f"says {got.get('score')} (faked pick {got.get('faked')})")
+        if a["faked"] is not None:
+            faked.append(i)
+        scores[i] = a["score"]
+    claimed = res.get("score") or []
+    counted = [k for k in range(len(claimed)) if _verdict(res, k)]
+    if counted and doc["phase1"].get("audited_score") is not None:
+        idx_of = {k: x["index"] for x, k in ((x, k) for k, x in enumerate(doc["scenes"]))}
+        vals = [scores.get(idx_of.get(k), claimed[k] if claimed[k] is not None else 0.0) for k in counted]
+        want = math.fsum(float(v) for v in vals) / len(vals)
+        if not _close(doc["phase1"]["audited_score"], want, MEAN_TOL):
+            bad.append(f"phase 1: audited score {doc['phase1']['audited_score']} is not the mean {round(want, 6)} with "
+                       "the audited scenes' scores")
+    return faked, bad
+
+
 def phase2_check(doc: dict) -> dict | None:
     p2 = doc.get("phase2") or None
     if p2 is None:
@@ -425,6 +499,11 @@ def phase2_check(doc: dict) -> dict | None:
         if o == "wall_timeout" or slow:
             over.append(i)
     n = len(idx) - len(unknown) - len(infra)
+    if p2.get("audited") is not None:
+        mism, problems = _audit(doc, p2, pos)
+        return {"scenes": len(idx), "compared": n, "equal": n - len(mism), "mismatched": mism, "over_wall": over,
+                "infra": infra, "unknown": unknown, "passed": n > 0 and not over and not unknown,
+                "status": p2.get("status"), "reason": p2.get("reason"), "audit_problems": problems}
     return {"scenes": len(idx), "compared": n, "equal": n - len(mism), "mismatched": mism, "over_wall": over,
             "infra": infra, "unknown": unknown, "passed": n > 0 and not mism and not over and not unknown,
             "status": p2.get("status"), "reason": p2.get("reason")}
@@ -459,28 +538,29 @@ def _sample_problems(doc: dict, p2: dict) -> list[str]:
     if bad:
         return bad
     want = phase2_sample(seed, ok, len(got) if k is None else k)
+    if (doc["phase2"].get("sample_seed") or {}).get("source") not in (None, "salt"):
+        cut = [x["index"] for j, x in enumerate(rows) if res["outcome"][j] in CUT_OFF and res["action_hash"][j]]
+        want = sorted(set(want) | set(cut))
     if got != want:
         size = f"{len(want)} = min(phase2_scenes {k}, {len(ok)})" if k is not None else str(len(got))
         left = f", leaving out {', '.join(sorted(out))}" if doc.get("excluded_outcomes") is not None else ""
         return [f"phase 2 ran on other scenes than the sample rule picks from the {len(ok)} eligible phase-1 "
-                f"scenes{left} (the {size} smallest sha256(seed:phase2:index), sorted: {want[:10]})"]
+                f"scenes{left} (the {size} smallest sha256(seed:phase2:index), plus the cut-off scenes, sorted: "
+                f"{want[:10]})"]
     return []
 
 
 def sample_seed(doc: dict) -> tuple[str, list[str]]:
-    """The seed of the phase-2 sample: the salt for a relayed phase 1, else the published beacon. A chain beacon is
-    checked: its seed must be sha256(f"{block hash}:phase2:{submission id}")."""
+    """The seed of the phase-2 sample: the salt for a relayed phase 1, else the published beacon: the hash of one chain
+    block (the round's), so a chain beacon's seed must equal its block hash."""
     got = (doc.get("phase2") or {}).get("sample_seed") or {"source": "salt"}
     src = got.get("source")
     if src == "salt":
         return doc["salt"], []
     if not got.get("seed"):
         return doc["salt"], [f"phase 2 publishes no sample seed (source {src})"]
-    if src == "chain":
-        want = hashlib.sha256(f"{got.get('hash')}:phase2:{doc['submission']['id']}".encode()).hexdigest()
-        if got["seed"] != want:
-            return got["seed"], [f"the phase-2 sample seed is not sha256(block {got.get('block')} hash:phase2:"
-                                 "submission)"]
+    if src == "chain" and got["seed"] != got.get("hash"):
+        return got["seed"], [f"the phase-2 sample seed is not the hash of block {got.get('block')}"]
     return str(got["seed"]), []
 
 
@@ -561,7 +641,8 @@ def _final_problems(doc: dict, st: str, warnings: list) -> list[str]:
     another weight w: (1 - w) * phase-1 score + w * that score), else the phase-1 score. The private scenes are not
     published: its score is taken as published."""
     fs, ev = doc.get("final_score"), doc.get("phase2_eval") or None
-    p1 = (doc.get("phase1") or {}).get("score")
+    ph1 = doc.get("phase1") or {}
+    p1 = ph1.get("audited_score") if ph1.get("audited_score") is not None else ph1.get("score")
     if fs is None:
         if st in ("ranked", "not_ranked") and ev is not None:
             return [f"{st} after a private evaluation, but the document has no final_score"]
@@ -625,6 +706,8 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
     above_bar = eligible(doc)
     what = (f"the king's best {bar} + margin {margin}" if legacy else f"the bar {bar}")
     p2 = phase2_check(doc)
+    if p2 is not None:
+        bad += p2.get("audit_problems") or []
     if legacy:
         warnings.append("an older document: its king run and decisive re-check (if any) are not checked "
                         "(phase 1, phase 2 and the bar are checked)")
