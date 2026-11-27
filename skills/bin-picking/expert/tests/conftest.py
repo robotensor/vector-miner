@@ -15,7 +15,7 @@ REF = "ghcr.io/alice/bin-expert@sha256:" + "a" * 64
 D = "sha256:" + "a" * 64
 HOT = Keypair.create_from_uri("//Alice").ss58_address
 SALT = "5e" * 16
-ENV = {"version": "0.1.0", "assets_version": "2026.11.1", "assets_sha256": "e" * 64}
+ENV = {"version": "0.2.0", "assets_version": "2026.11.1", "assets_sha256": "e" * 64}
 
 
 @pytest.fixture(autouse=True)

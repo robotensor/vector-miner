@@ -9,11 +9,14 @@
 //   harness -> {"type":"state", pick, tick, t, qpos, qvel}      (after each act, until the pick's verdict)
 //   expert  -> {"type":"act", "rows": []}                      (no rows: hold the last row until the verdict)
 //   harness -> {"type":"pick", pick, outcome, t, tick, outs, next: {pick, target} | null, qpos, qvel, obs}
-//              (vector-expert/3: after each pick; the next pick starts from where the robot is)
+//              (vector-expert/3: after each pick; the next pick starts from where the robot is; no obs when
+//              next is null)
 //   harness -> {"type":"end", outcome, t, tick}                 (after the last pick)
 //
-// One JSON object per line; stdout carries only protocol messages (log to stderr). Deadlines: 10 s for the first
-// act, 2 s for each later one. The same messages must always give the same rows (no clocks, no unseeded random).
+// One JSON object per line; stdout carries only protocol messages (log to stderr). Time: the local and docker
+// harness (eval, phase 1, phase 2) limit only the expert's own time, 120 s per pick (wall_s); the step deadlines
+// (10 s for the first act, 2 s for each later one) apply only to remote experts. The same messages must always give
+// the same rows (no clocks, no unseeded random).
 import readline from 'node:readline';
 
 const CHUNK = Number(process.env.EXPERT_CHUNK || 20); // rows per act; one row is one tick (1/20 s) of robot time

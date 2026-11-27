@@ -145,10 +145,11 @@ it for the first time at once (a thread may then hold the old module object inst
 
 ## 8. Rounds
 
-What miners run for a round is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim. Round 1 of
-`bin-picking-expert` is `bin-picking-expert-r1`. The READMEs tell miners to clone vector-miner, vector-env and
-vector-sim side by side at the tag (`git clone --branch bin-picking-expert-r1 https://github.com/robotensor/<repo>`),
-then run `scripts/setup.sh`, which keeps those checkouts. No `v<number>` tag is used as a pin.
+What miners run for a round is the git tag `<leaf-id>-r<n>` in vector-miner, vector-env and vector-sim. Round 2 of
+`bin-picking-expert` is `bin-picking-expert-r2`. The READMEs tell miners to clone vector-miner, vector-env and
+vector-sim side by side at the tag (`git clone --branch bin-picking-expert-r2 https://github.com/robotensor/<repo>`),
+then run `scripts/setup.sh`, which keeps those checkouts. No `v<number>` tag is used as a pin. Round 1 was
+`bin-picking-expert-r1` of vector-miner; it installed vector-env and vector-sim at `v0.1.0`.
 
 ## 9. Compatibility
 

@@ -15,17 +15,19 @@ and emission; an expert or policy leaf also has its own submission fee.
 ## Rounds and pins
 
 Each leaf runs in rounds of its own. What you run for a round is the git tag `<leaf id>-r<n>` in vector-miner,
-vector-env and vector-sim. Round 1 of `bin-picking-expert` is `bin-picking-expert-r1`. Clone the three repositories
+vector-env and vector-sim. Round 2 of `bin-picking-expert` is `bin-picking-expert-r2`. Clone the three repositories
 side by side at the tag of the round you play, then run setup:
 
 ```bash
 for repo in vector-miner vector-env vector-sim; do
-  git clone --branch bin-picking-expert-r1 https://github.com/robotensor/$repo
+  git clone --branch bin-picking-expert-r2 https://github.com/robotensor/$repo
 done
 cd vector-miner && scripts/setup.sh
 ```
 
 `setup.sh` keeps the vector-env and vector-sim checkouts beside it.
+
+Round 1 was `bin-picking-expert-r1` of vector-miner; it installed vector-env and vector-sim at `v0.1.0`.
 
 ## Setup
 

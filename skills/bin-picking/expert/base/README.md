@@ -12,7 +12,7 @@ is the same loop with a fixed blind motion, packaged with `@vector/sim` and a Do
 Replace `expert.mjs` with your own, keeping the same message loop. The image is tagged with the round tag:
 
 ```dockerfile
-FROM <registry>/vector-expert-base:bin-picking-expert-r1
+FROM <registry>/vector-expert-base:bin-picking-expert-r2
 COPY expert.mjs /expert/
 ```
 
@@ -30,7 +30,7 @@ From the vector-miner folder:
 ## Build it (maintainers)
 
 ```bash
-skills/bin-picking/expert/base/build.sh                                  # vector-expert-base:bin-picking-expert-r1
+skills/bin-picking/expert/base/build.sh                                  # vector-expert-base:bin-picking-expert-r2
 VECTOR_SIM_REF=<round tag> skills/bin-picking/expert/base/build.sh       # vector-expert-base:<round tag>
 ```
 

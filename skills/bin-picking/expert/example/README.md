@@ -51,7 +51,7 @@ starts at once.
 .venv/bin/vector-miner eval --image ghcr.io/<you>/bin-expert:dev --scenes 30 --seed 1 --workers 4
 ```
 
-The Dockerfile fetches vector-sim at `ARG VECTOR_SIM_REF=bin-picking-expert-r1`, the round tag: the `@vector/sim`
+The Dockerfile fetches vector-sim at `ARG VECTOR_SIM_REF=bin-picking-expert-r2`, the round tag: the `@vector/sim`
 of `package-lock.json` and the simulator the harness runs in that round. Keep the default. For a later round, build
 with `--build-arg VECTOR_SIM_REF=<round tag>` (a tag, a branch or a full commit sha) and update
 `package-lock.json`. `VECTOR_SIM_GIT` sets the repository. This `ARG` line is the round's one pin:

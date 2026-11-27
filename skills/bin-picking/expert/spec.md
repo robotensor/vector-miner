@@ -50,6 +50,17 @@ variable (`VECTOR_MINER_API`), output line, JSON field and exit code, with these
   w·score; phase 1 without a private evaluation); the round decision
   uses the final score, the gate the phase-1 score; both must be above `min_score` (0 when absent). Documents
   without `score_formula` keep the success-rate check.
+- `subverify` audit: a document whose phase 2 has `audited` is checked as an audit. `phase1.score` is the claimed mean
+  and `phase1.audited_score` the mean with the audited scenes' scores in place of the claimed ones. Each audited scene
+  (`phase2.scenes`) is recomputed by `audit_scene` from the published claimed picks (`phase1.results.picks`) and the
+  re-run's picks (`phase2.picks`): picks are compared in order (`same_pick`: action hash, target, outcome, tick, outs,
+  parts out); the first claimed pick that differs scores `phase2.fake_pick_score`, every other pick the re-run's gain
+  (`score`); a claim whose outcome is a cut-off (`wall_timeout`, `step_timeout`, `disconnected`) is compared up to its
+  open pick; the outs penalty is the re-run's. The score and the faked pick must equal `phase2.audited[index]`
+  (`audit_problems`, a document problem otherwise). `phase2_check.mismatched` lists the scenes with a faked pick; a
+  phase 2 passes with a faked pick, and fails on a `wall_timeout` or a pick over `wall_s`. A document without `audited`
+  keeps the exact-match rule on the action hashes. A scene row with `bury: false` is regenerated from its seed without
+  the bury (`verify._without_bury`).
 - The leaf commands take the wallet flags from `vector_miner.wallet.common()`. The module keeps a module-level
   `_keypair` that the commands call (tests replace it).
 
@@ -57,11 +68,15 @@ variable (`VECTOR_MINER_API`), output line, JSON field and exit code, with these
   on the scenes run at once here (default: none, the server's `scenes_at_once`); `--warm` is accepted and has no effect
   (one note line on stderr); `--stderr DIR` keeps each scene's expert stderr in `DIR/<index:04d>-<scene_id>.log`.
   `serve` needs a vector-env with `harness.check_claim` (else it exits with one line).
+- `serve` stops with exit 1 and one line (`serve.mismatch(welcome)`) when it cannot reproduce what the subnet re-runs:
+  the welcome's `phase1` is not `scene` (the old relay mode: run the vector-miner of the round you committed in), or
+  the welcome's `env` `{version, sim}` differs from this machine's vector-env version or vector-sim code pin
+  (`serve.local_pin()`; set up the round tag with `scripts/setup.sh`). A welcome without `phase1` or `env` is played.
 - `eval` runs its scenes with `harness.run` (the phase-1 path) and reports `expert_time` (`wall_s`, `pick_max_s`,
   `pick_mean_s`, `picks`, `over_scenes`) instead of `deadlines`; `--strict` exits 1 when a pick's `expert_s` is over
   `--wall`. `--first-step-deadline` and `--step-deadline` are accepted, hidden, and have no effect (one note line).
 - `status`: the `phase1` verdict is `phase 1: <done>/<total> scenes answered by your miner (run on your machine)`
-  `; claimed score so far <score> (phase 2 re-runs a sample)` (when the API gives a score) `; keep serve running`.
+  `; claimed score so far <score> (phase 2 audits a sample)` (when the API gives a score) `; keep serve running`.
 
 ## 3. API
 
@@ -96,10 +111,10 @@ ends_at} | null, "final_round", "round_mode", "interval_s", "fee"}`. The kit rea
 The server sends whole scenes; the miner's machine runs each with vector-env's harness and answers with its claim.
 
 ```
-server -> {"type":"welcome", submission, status, done, scenes, scenes_at_once, scene_deadline_s}
+server -> {"type":"welcome", submission, status, done, scenes, scenes_at_once, scene_deadline_s, phase1, env:{version, sim}}
 server -> {"type":"scene","index":i,"scene":{scene_id, seed, xml, meta, checkpoint, state_hash, target, target_class,
           env},"limits":{time_limit_s, picks, max_rows, tick_s, control_hz, wall_s, score, max_abs?}}
-miner  -> {"type":"result","index":i,"result":harness.wire_result(result, limits)}
+miner  -> {"type":"result","index":i,"result":harness.wire_result(result, limits)}   # no action rows: the hashes only
 server -> {"type":"ack","index":i,"ok":bool,"reason":str|null,"score":float|null}
 server -> {"type":"done", ...} | {"type":"error", reason, message, index?}
 ```
@@ -108,7 +123,7 @@ server -> {"type":"done", ...} | {"type":"error", reason, message, index?}
   process per scene (`argv`, default `[python, "-c", CHILD]`, own session) that runs `serve.play(job)`:
   `harness.run(expert, [scene], time_limit_s, wall_s=limits.wall_s or env.yaml, docker, stderr_dir,
   bundle=assets.for_scene(scene))`, then `wire_result(r, limits)` and `check_claim(scene, claim, limits)`; a failure
-  there answers `harness_error` with no rows (`serve.failed`). A claim that fails `check_claim` is still sent, with
+  there answers `harness_error` with no action hash (`serve.failed`). A claim that fails `check_claim` is still sent, with
   a warning. Image experts get `--label vector-miner.serve=<tag>` (docker `args`), so `close()` kills exactly this
   miner's containers (`docker ps --filter label=...`, `docker kill`), then each scene's process group.
 - Answers outlive a connection: `claims[index]` is kept, `unacked` holds the indexes without an `ack`; every
@@ -127,7 +142,7 @@ server -> {"type":"done", ...} | {"type":"error", reason, message, index?}
 - `example/package.json`: `"@vector/sim": "file:../../../../../vector-sim/js"` (vector-sim beside this checkout);
   `package-lock.json` regenerated; `solve.mjs` unchanged.
 - `example/Dockerfile`: `ARG VECTOR_SIM_GIT=https://github.com/robotensor/vector-sim`, `ARG
-  VECTOR_SIM_REF=bin-picking-expert-r1` (the round tag: `scripts/setup.sh` reads this line); fetches vector-sim at
+  VECTOR_SIM_REF=bin-picking-expert-r2` (the round tag: `scripts/setup.sh` reads this line); fetches vector-sim at
   the ref into `/vector-sim` and runs `npm ci --omit=dev` in its `js/`; `WORKDIR /x/skills/bin-picking/expert/example`;
   copies `package.json`, `package-lock.json` and `*.mjs`; `npm ci --omit=dev`; `ENV VECTOR_SIM_BUNDLE=/bundle
   HOME=/tmp`; `USER 65534:65534`; `ENTRYPOINT ["node", "solve.mjs"]`.
