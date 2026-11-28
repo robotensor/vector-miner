@@ -42,26 +42,27 @@ pick the subnet names one target part: lift it out and hold it above the lift li
 pick has 15 s of robot time. Targets are not only the free ones on top: a target can be blocked (other parts lie on
 it or press against it), partly buried, or hidden: not visible to the camera, covered by one or two layers of parts.
 Only one part may be picked at a time: the moment two or more parts are above the lift line at the same tick, the
-pick ends as a failure (`multi_pick`, pick score 0). You may move other parts inside the bin (push them, lift them
+pick ends as a failure (`multi_pick`, pick score 0, or -1 with an out). You may move other parts inside the bin (push them, lift them
 one at a time and put them down); lifting one part that is not the target is not a failure, and a dropped target
 can be tried again until the pick's time runs out. The next pick's target is
 named when a pick ends, never a part a pick of this scene already failed on; when no target is left the scene ends
 early and its remaining picks score 0. Scenes may also come from other assets in the same format (phase 2).
 
-**Nothing may leave the bin.** A part that ends up outside the bin is an *out*. Outs do not end a pick; they are
-counted over the whole scene and cost exponentially more the more there are.
+**Nothing may leave the bin.** A part that ends up outside the bin is an *out*. Outs do not end a pick. Every pick
+scores on its own:
 
 ```
-pick i:      s_i * (1 - 0.5 * min(1, t_i / 15 s))          s_i = 1 if pick i succeeded, else 0; t_i = its robot time
-scene score: (sum of the 10 pick scores - (2^K - 1)) / 10   K = the parts out of the bin in the whole scene
+pick i:  -1                                  at least one part left the bin during pick i, whatever else happened
+         1 - 0.5 * min(1, t_i / 15 s)        else, if pick i picked its target (t_i = its robot time): 1.0 down to 0.5
+         0                                   else
 ```
 
-1.0 is ten instant picks; one part out costs as much as one lost pick, 2 outs cost 3 picks, 10 outs cost 1,023, so a
-scene score can be far below 0. The phase-1 score is the mean scene score over all your scenes: a scene your machine
-could not run (an infrastructure outcome), a refused answer and a scene not answered in time each score 0. The
+A planned pick that never ran (the scene ended early) scores 0. The phase-1 score is the sum of all your pick
+scores over all planned picks (100 scenes x 10 picks = 1,000 picks), and can be below 0. A scene your machine could
+not run (an infrastructure outcome), a refused answer and a scene not answered in time score 0 on all their picks. The
 formula of a round is fixed when its scenes are drawn and published in each submission's verify document
 (`score_formula`; it also has a path-length weight, 0 now). A scene whose simulation diverges ends `physics_error`:
-that pick scores 0, the earlier picks count, and the scene counts. A scene cut off on your side (`wall_timeout`,
+that pick scores 0 (-1 with an out), the earlier picks count, and the scene counts. A scene cut off on your side (`wall_timeout`,
 `step_timeout`, `disconnected`) is scored by its picks so far. After phase 2 the audited scenes score what phase 2
 found (see Phase 2).
 
@@ -127,13 +128,14 @@ that could not be made is tried again when your submission's turn comes, and an 
 (docker, `--network none`, vector-env's harness) on a random sample of your phase-1 scenes (20 by default, its
 `phase2_scenes`) and on every scene whose claim ended in a cut-off (`wall_timeout`, `step_timeout`,
 `disconnected`). The sample is drawn with the hash of the first chain block after the one current when the round's
-phase 2 started; the round's private scenes use the same block. Phase 2 is an audit of your claims. A scene's claimed
-picks are compared in order with the re-run's (action hash, target, outcome, tick, outs, parts out). The first claimed
-pick that differs is a faked pick: it scores -1 (`fake_pick_score` in the verify document) instead of its gain. Every
-other pick, before and after it, scores what the re-run did. A cut-off claim is compared up to its open pick; from
-there the re-run's picks count as usual. The outs penalty is the re-run's. The audited scene score replaces the
-claimed one, and your phase-1 score becomes the mean with the audited scenes (the claimed mean stays in the verify
-document). A faked pick does not disqualify. The expert's own time in each pick (`expert_s`: the time from each message
+phase 2 started; the round's private scenes use the same block. Phase 2 is an audit of your claims. Every audited pick
+is scored by the formula from its own fields, your claimed picks and the re-run's alike. The over-claim O is the sum
+of your claimed pick scores minus the sum of the re-run's over all audited picks (20 scenes: 200 picks). A cut-off
+claim is compared up to its open pick; after the cut the scene follows the re-run's own trajectory and is not
+compared. When O is above the tolerance (`fake_tolerance` in the verify document, 0.1 points), the submission is
+refused as faked: `disqualified`, "phase 2: the re-run scored O points below the claim on the audited picks", and it
+is not ranked. Otherwise the audited picks take the re-run's scores and your phase-1 score is recomputed with them
+(the claimed score stays in the verify document). A claim below the re-run is never refused. The expert's own time in each pick (`expert_s`: the time from each message
 to your expert's answer, the simulation not counted) must stay within the wall budget of a pick (`wall_s`); one pick
 over disqualifies the submission.
 
@@ -521,8 +523,8 @@ decision), the API publishes everything needed to check it at
 vector-env version and asset sha256 the scenes were made with, every scene's seed and state hash, the score formula
 (`score_formula`), phase 1 (the claimed score, the audited score and per-scene success, time, outcome, action hash,
 scene score, outs, path length, and per pick its outcome, time, outs and path), phase 2 (the audited scenes, the
-re-run's picks, action hashes and wall times, and per audited scene its audited score, its faked pick and its claimed
-score), the
+re-run's picks, action hashes and wall times, per audited scene its audited score, its claimed score and how far
+the claimed picks are over the re-run's, the over-claim O and the tolerance), the
 private evaluation as a summary (`phase2_eval`: scenes, score, outs, mean time), `final_score` and the
 decision `{round, bar, rank_at, new}` (the bar, the rank it entered with, the submission ids that entered at its
 round's decision); `submission.mirror_url` names the subnet's private copy of the image, which only the team can
@@ -587,10 +589,11 @@ flowchart LR
   scene has an outcome, an action hash, the re-run's picks (`phase2.picks`) and a wall time; phase-2 infrastructure
   failures are left out of the audit, and it passes when at least one scene is audited and no scene is a
   `wall_timeout` or has a pick whose expert time (`phase2.pick_expert_s`) is over `wall_s` (without per-pick times: a
-  scene wall time over `scene_wall_s`). Each audited scene is recomputed from the published claimed picks and the
-  re-run's picks (the first claimed pick that differs scores `phase2.fake_pick_score`, every other pick the re-run's
-  gain, a cut-off claim is compared up to its open pick, the outs penalty is the re-run's) and must give the
-  published `phase2.audited[index]` score and faked pick; a document whose phase 2 has no `audited` (an older round)
+  scene wall time over `scene_wall_s`), and the over-claim is not above the tolerance. Each audited scene is
+  recomputed from the published claimed picks and the re-run's picks (every pick scored by the formula from its own
+  fields; a cut-off claim compared up to its open pick) and must give the published `phase2.audited[index]` `score`
+  and `over`; their sum must be `phase2.over_claim`, and `phase2.faked` must be `over_claim > fake_tolerance`; a
+  document whose phase 2 has no `audited` (an older round)
   keeps the exact-match rule: every hash equals phase 1's; `disqualified` needs a phase 2 that did not pass and a reason, or a reason
   that starts with `image no longer available` / `repeated failures on our side` (then nothing after phase 1 is
   needed); `ranked` and `not_ranked` need phase 2 passed. The decision: `decision.round` is the submission's
@@ -606,8 +609,9 @@ flowchart LR
   with `--sample-seed`, and reports `hash_equal`, `hash_agreement`, `outcome_agreement` and every scene whose action
   hash differs. A deterministic image gives the published hashes on any machine. Re-run differences do not change
   the exit code.
-- `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched` (the scenes with a faked
-  pick), `over_wall`, `infra`, `passed`, and `audit_problems` (what the recomputed audit does not match); `decision` the round decision: `round`, `bar`, `rank_at`, `new` (how many entered), `entered`,
+- `phase2` in the output repeats the phase-2 comparison: `compared`, `equal`, `mismatched` (the scenes whose claimed
+  pick scores are not the re-run's), `over_wall`, `infra`, `over_claim`, `fake_tolerance`, `faked`, `passed`, and
+  `audit_problems` (what the recomputed audit does not match); `decision` the round decision: `round`, `bar`, `rank_at`, `new` (how many entered), `entered`,
   `above_bar` (the final score against the bar; null for an older document without `decision.bar`).
 - The document is read as strict JSON (no NaN), at most 64 MB, and every field is type-checked first.
 - A scene row with `bury: false` is a scene whose hidden target was found not to be buried; `verify` regenerates it from

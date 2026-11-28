@@ -651,7 +651,7 @@ def test_pile_scores_without_a_king_need_the_minimum_score(capsys, env, tmp_path
 
 
 def make_picks_doc(e, status="ranked", picks=10):
-    """Scenes of several picks in the same bin: scene score = (sum of pick scores - outs penalty) / picks."""
+    """Scenes of several picks in the same bin: scene score = (sum of pick scores) / picks, a pick with an out -1."""
     doc = make_pile_doc(e, status)
     res, lim = doc["phase1"]["results"], doc["task"]["time_limit_s"]
     doc["task"]["picks"] = picks
@@ -688,6 +688,97 @@ def test_scenes_of_several_picks_are_scored_from_their_picks(capsys, env, tmp_pa
                      (_set(["phase1", "mean_time_s"], 1.0), "or of its successful picks")):
         code, got, _ = problems(capsys, tmp_path, _t(doc, fn))
         assert code == 1 and any(want in p for p in got), (want, got)
+
+
+def make_audit_doc(e, status="ranked", fake_scene=None, tol=0.1):
+    """A document whose phase 2 audited the claims: the re-run's picks per audited scene, each audited scene's score
+    and over-claim, O and the tolerance. `fake_scene`: the image did not pick what that scene's claim says."""
+    doc = make_picks_doc(e, status)
+    res, lim, p2 = doc["phase1"]["results"], doc["task"]["time_limit_s"], doc["phase2"]
+    pos = {x["index"]: k for k, x in enumerate(doc["scenes"])}
+    picks, audited, scores = [], {}, {}
+    for i in p2["scenes"]:
+        k = pos[i]
+        rp = copy.deepcopy(res["picks"][k])
+        if i == fake_scene:
+            for pk in rp:
+                pk["outcome"] = "missed" if pk["outcome"] == "success" else pk["outcome"]
+        picks.append(rp)
+        a = subverify.audit_scene(res["picks"][k], rp, cut=False, formula=doc["score_formula"], time_limit_s=lim,
+                                  planned=10)
+        audited[str(i)] = {**a, "claimed": res["score"][k], "cut": False}
+        scores[k] = a["score"]
+    over = round(sum(a["over"] for a in audited.values()), 6)
+    faked = over > tol
+    p2.update(picks=picks, audited=audited, over_claim=over, fake_tolerance=tol, faked=faked,
+              mismatched=[fake_scene] if fake_scene is not None else [])
+    if faked:
+        p2.update(status="failed", reason=f"phase 2: the re-run scored {over:g} points below the claim")
+    counted = [k for k in range(len(res["score"])) if subverify._verdict(res, k)]
+    doc["phase1"]["audited_score"] = sum(scores.get(k, res["score"][k]) for k in counted) / len(counted)
+    if status in ("ranked", "not_ranked"):
+        doc["final_score"] = doc["phase1"]["audited_score"]
+        doc["decision"]["bar"] = doc["final_score"] - 0.05
+    if status == "disqualified":
+        doc["submission"]["reason"] = p2["reason"]
+        doc["final_score"] = None
+    return doc
+
+
+def test_the_phase2_audit_is_recomputed_from_the_picks(capsys, env, tmp_path):
+    doc = make_audit_doc(fake_env(broken=BROKEN), "ranked")
+    assert doc["phase2"]["over_claim"] == 0.0
+    code, got, out = problems(capsys, tmp_path, doc)
+    assert code == 0 and got == [], got
+    assert out["phase2"]["over_claim"] == 0.0 and out["phase2"]["faked"] is False and out["phase2"]["passed"]
+    i = doc["phase2"]["scenes"][0]
+    for fn, want in ((_set(["phase2", "audited", str(i), "score"], 0.9), f"audited scene {i} gives score"),
+                     (_set(["phase2", "audited", str(i), "over"], 0.5), f"audited scene {i} gives score"),
+                     (_set(["phase2", "over_claim"], 0.5), "over-claim 0.5 is not the sum"),
+                     (_set(["phase2", "faked"], True), "faked = True"),
+                     (_set(["phase1", "audited_score"], 0.99), "is not the mean")):
+        code, got, _ = problems(capsys, tmp_path, _t(doc, fn))
+        assert code == 1 and any(want in p for p in got), (want, got)
+
+
+def test_a_claim_over_the_rerun_by_more_than_the_tolerance_is_faked(capsys, env, tmp_path):
+    e = fake_env(broken=BROKEN)
+    probe = make_audit_doc(e, "ranked")
+    fake = next(i for i in probe["phase2"]["scenes"]
+                if any(pk["outcome"] == "success" for pk in probe["phase1"]["results"]["picks"][
+                    [x["index"] for x in probe["scenes"]].index(i)]))
+    dq = make_audit_doc(e, "disqualified", fake_scene=fake)
+    p2 = dq["phase2"]
+    assert p2["over_claim"] > 0.1 and p2["faked"] and p2["audited"][str(fake)]["over"] == p2["over_claim"]
+    code, got, out = problems(capsys, tmp_path, dq)
+    assert code == 0 and got == [], got
+    assert out["phase2"]["faked"] and not out["phase2"]["passed"] and out["phase2"]["mismatched"] == [fake]
+    # ranked although the claim is over the re-run by more than the tolerance
+    code, got, _ = problems(capsys, tmp_path, _t(dq, lambda d: (d["submission"].update(status="ranked", reason=None),
+                                                                d["phase2"].update(status="passed", reason=None))))
+    assert code == 1 and any("over-claim" in p or "points over the re-run" in p for p in got), got
+    # within a larger tolerance the same document passes and is ranked with the re-run's scores
+    ok = make_audit_doc(e, "ranked", fake_scene=fake, tol=1000.0)
+    code, got, out = problems(capsys, tmp_path, ok)
+    assert code == 0 and got == [] and out["phase2"]["passed"] and not out["phase2"]["faked"], got
+    assert ok["phase1"]["audited_score"] < ok["phase1"]["score"]
+    # disqualified while the over-claim is within the tolerance
+    code, got, _ = problems(capsys, tmp_path, _t(ok, lambda d: d["submission"].update(status="disqualified",
+                                                                                      reason="x")))
+    assert code == 1 and any("within the tolerance" in p for p in got), got
+
+
+def test_the_audit_compares_a_cut_off_claim_up_to_its_open_pick():
+    f = {"formula": "pile-2", "time_weight": 0.5, "path_weight": 0.0, "path_ref_m": 3.0, "out_unit": 1.0}
+    win = {"outcome": "success", "t": 0.0, "outs": 0}
+    claim = [win, win, {"outcome": "wall_timeout", "t": 3.0, "outs": 0}]
+    rerun = [win, win, win, {"outcome": "missed", "t": 15.0, "outs": 1}] + [win] * 6
+    a = subverify.audit_scene(claim, rerun, cut=True, formula=f, time_limit_s=15.0, planned=10)
+    assert a == {"score": 0.8, "over": 0.0, "compared": 2}
+    whole = subverify.audit_scene([win] * 10, rerun, cut=False, formula=f, time_limit_s=15.0, planned=10)
+    assert whole == {"score": 0.8, "over": 2.0, "compared": 10}
+    assert subverify.pick_score({"outcome": "success", "t": 15.0, "outs": 0}, f, 15.0) == 0.5
+    assert subverify.pick_score({"outcome": "success", "t": 0.0, "outs": 4}, f, 15.0) == -1.0
 
 
 def test_not_ranked_without_phase_2_needs_three_ahead(capsys, env, tmp_path):

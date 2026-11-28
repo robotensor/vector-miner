@@ -50,15 +50,19 @@ variable (`VECTOR_MINER_API`), output line, JSON field and exit code, with these
   w·score; phase 1 without a private evaluation); the round decision
   uses the final score, the gate the phase-1 score; both must be above `min_score` (0 when absent). Documents
   without `score_formula` keep the success-rate check.
-- `subverify` audit: a document whose phase 2 has `audited` is checked as an audit. `phase1.score` is the claimed mean
+- `subverify` pile-2 scenes: `pick_score` = -out_unit (-1) when the pick has outs > 0, whatever else happened; else
+  (1 - time_weight·min(1, t / time_limit_s))·(1 - path_weight·min(1, tcp_path_m / path_ref_m)) for a success; else 0
+  (6 decimals). `picks_score` = the sum of the pick scores / P; no penalty over the whole scene.
+- `subverify` audit: a document whose phase 2 has `audited` is checked as an audit. `phase1.score` is the claimed score
   and `phase1.audited_score` the mean with the audited scenes' scores in place of the claimed ones. Each audited scene
   (`phase2.scenes`) is recomputed by `audit_scene` from the published claimed picks (`phase1.results.picks`) and the
-  re-run's picks (`phase2.picks`): picks are compared in order (`same_pick`: action hash, target, outcome, tick, outs,
-  parts out); the first claimed pick that differs scores `phase2.fake_pick_score`, every other pick the re-run's gain
-  (`score`); a claim whose outcome is a cut-off (`wall_timeout`, `step_timeout`, `disconnected`) is compared up to its
-  open pick; the outs penalty is the re-run's. The score and the faked pick must equal `phase2.audited[index]`
-  (`audit_problems`, a document problem otherwise). `phase2_check.mismatched` lists the scenes with a faked pick; a
-  phase 2 passes with a faked pick, and fails on a `wall_timeout` or a pick over `wall_s`. A document without `audited`
+  re-run's picks (`phase2.picks`), every pick scored by `pick_score` from its own fields: the compared picks are every
+  pick either side has, or, for a claim whose outcome is a cut-off (`wall_timeout`, `step_timeout`, `disconnected`),
+  the picks before its open pick; `over` = the claimed pick scores - the re-run's over the compared picks; `score` =
+  the re-run's pick scores / P. `score` and `over` must equal `phase2.audited[index]`, their sum O must equal
+  `phase2.over_claim`, and `phase2.faked` must be O > `phase2.fake_tolerance` (`audit_problems`, a document problem
+  otherwise). `phase2_check.mismatched` lists the scenes whose claimed pick scores differ from the re-run's; a phase 2
+  fails when O is above the tolerance, on a `wall_timeout` or on a pick over `wall_s`. A document without `audited`
   keeps the exact-match rule on the action hashes. A scene row with `bury: false` is regenerated from its seed without
   the bury (`verify._without_bury`).
 - The leaf commands take the wallet flags from `vector_miner.wallet.common()`. The module keeps a module-level

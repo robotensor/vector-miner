@@ -172,6 +172,9 @@ def validate(doc: dict) -> None:
             _ints(p2.get(f), f"phase2.{f}")
         for j, v in enumerate(_arr(p2.get("wall_s"), "phase2.wall_s", MAX_SCENES)):
             _num(v, f"phase2.wall_s[{j}]")
+        for f in ("over_claim", "fake_tolerance"):
+            _num(p2.get(f), f"phase2.{f}")
+        _flag(p2.get("faked"), "phase2.faked")
     _str(sub.get("mirror_url"), "submission.mirror_url")
     _int(sub.get("round"), "submission.round", 0, 1 << 31, null=True)
     dec = _obj(doc.get("decision"), "decision")
@@ -313,19 +316,27 @@ def scene_score(success: bool, t, outs, tcp_path_m, formula: dict, time_limit_s:
     return f_time * f_path - pen
 
 
+def pick_score(pk: dict, formula: dict, time_limit_s: float) -> float:
+    """One pick's score (pile-2): -out_unit (-1) when a part left the bin during the pick (its outs > 0), whatever else
+    happened; else (1 - time_weight * min(1, t / time_limit_s)) * (1 - path_weight * min(1, tcp_path_m / path_ref_m))
+    when its target was picked; else 0. Rounded to 6 decimals, as the subnet stores it."""
+    pk = pk if isinstance(pk, dict) else {}
+    if max(0, int(pk.get("outs") or 0)) > 0:
+        return round(-float(formula.get("out_unit", 1.0) or 0.0), 6)
+    if not (pk.get("outcome") == "success" or pk.get("success") is True):
+        return 0.0
+    return round(scene_score(True, pk.get("t"), 0, pk.get("tcp_path_m"), formula, time_limit_s), 6)
+
+
 def picks_score(picks: list, formula: dict, time_limit_s: float, n_picks: int | None = None) -> tuple[float, int]:
-    """A scene of several picks in the same bin: (sum over picks of s_i * f_time_i * f_path_i - out_unit *
-    (2 ** min(K, 30) - 1)) / P, K = the outs of all its picks, P = the picks a scene has (`n_picks`, else the picks
-    listed). Each pick's t is its own robot time, against the per-pick time limit. Returns (score, K)."""
-    unit = float(formula.get("out_unit", 1.0) or 0.0)
-    gain, k_outs = 0.0, 0
+    """A scene of several picks in the same bin: (sum of its pick scores) / P, P = the picks a scene has (`n_picks`,
+    else the picks listed); a planned pick that never ran scores 0. Returns (score, the outs of all its picks)."""
+    total, k_outs = 0.0, 0
     for pk in picks:
-        pk = pk if isinstance(pk, dict) else {}
-        k_outs += max(0, int(pk.get("outs") or 0))
-        if pk.get("outcome") == "success" or pk.get("success") is True:
-            gain += scene_score(True, pk.get("t"), 0, pk.get("tcp_path_m"), formula, time_limit_s)
+        k_outs += max(0, int((pk if isinstance(pk, dict) else {}).get("outs") or 0))
+        total += pick_score(pk, formula, time_limit_s)
     n = int(n_picks) if n_picks else max(1, len(picks))
-    return (gain - unit * (2 ** min(k_outs, OUTS_CAP) - 1)) / n, k_outs
+    return total / n, k_outs
 
 
 def _n_picks(doc_task: dict, formula: dict) -> int | None:
@@ -394,52 +405,37 @@ def _scene_scores(name: str, part: dict, count: int, formula: dict, time_limit_s
     return bad
 
 
-AUDIT_KEYS = ("action_hash", "target", "outcome", "tick", "outs")
+def audit_scene(claimed: list, rerun: list, *, cut: bool, formula: dict, time_limit_s: float, planned: int) -> dict:
+    """An audited scene (the subnet's rule): every pick scored by the formula from its own fields, the claimed picks and
+    the re-run's alike. The compared picks are every pick either side has (a pick one side lacks scores 0 there), or,
+    for a cut-off claim, the picks before its open pick (after it the scene follows the re-run). `over` = the claimed
+    pick scores - the re-run's on the compared picks; `score` = the re-run's pick scores / P.
+    Returns {score, over, compared}."""
+    cp = [pick_score(p, formula, time_limit_s) for p in (claimed or []) if isinstance(p, dict)]
+    rp = [pick_score(p, formula, time_limit_s) for p in (rerun or []) if isinstance(p, dict)]
+    if cut:
+        n = max(0, len(cp) - 1)
+        over = math.fsum(cp[:n]) - math.fsum(rp[:n])
+    else:
+        n = max(len(cp), len(rp))
+        over = math.fsum(cp) - math.fsum(rp)
+    p = max(1, int(planned or 0) or len(rp), len(rp))
+    return {"score": round(math.fsum(rp) / p, 6), "over": round(over, 6), "compared": n}
 
 
-def same_pick(claimed: dict, rerun: dict) -> bool:
-    """A claimed pick is what the re-run of the image did: same actions, target, outcome, ticks, outs and parts out."""
-    if any(claimed.get(k) != rerun.get(k) for k in AUDIT_KEYS):
-        return False
-    return sorted(claimed.get("out_parts") or []) == sorted(rerun.get("out_parts") or [])
-
-
-def audit_scene(claimed: list, rerun: list, *, cut: bool, fake: float, out_unit: float, planned: int) -> dict:
-    """The audited scene's score (the subnet's rule): claimed and re-run picks compared in order; the first claimed
-    pick that differs scores `fake`; every other pick scores the re-run's gain (its `score`); a cut-off claim is
-    compared up to its open pick; the outs penalty is the re-run's. Returns {score, faked}."""
-    cp = [p for p in (claimed or []) if isinstance(p, dict)]
-    rp = [p for p in (rerun or []) if isinstance(p, dict)]
-    stop = len(cp) - 1 if cut and cp else len(cp)
-    faked, gains = None, []
-    for k, r in enumerate(rp):
-        if faked is None and k < stop and not same_pick(cp[k], r):
-            faked = k
-            gains.append(float(fake))
-            continue
-        gains.append(float(r.get("score") or 0.0))
-    if faked is None and not cut and len(cp) != len(rp):
-        faked = min(len(cp), len(rp))
-        if faked < len(gains):
-            gains[faked] = float(fake)
-        else:
-            gains.append(float(fake))
-    outs = sum(max(0, int(p.get("outs") or 0)) for p in rp)
-    n = max(1, int(planned or 0) or len(gains), len(gains))
-    return {"score": round((math.fsum(gains) - out_unit * (2 ** min(outs, OUTS_CAP) - 1)) / n, 6), "faked": faked}
-
-
-def _audit(doc: dict, p2: dict, pos: dict) -> tuple[list, list[str]]:
-    """Recompute every audited scene from the published claim and re-run picks: (faked scene indexes, problems)."""
+def _audit(doc: dict, p2: dict, pos: dict) -> tuple[list, float, list[str]]:
+    """Recompute every audited scene from the published claim and re-run picks: (scenes whose claimed pick scores
+    differ from the re-run's, the over-claim O, problems)."""
     res = doc["phase1"]["results"]
     picks1 = res.get("picks") if isinstance(res.get("picks"), list) else []
     outc = res.get("outcome") or []
     formula = doc.get("score_formula") or {}
-    unit = float(formula.get("out_unit", 1.0) or 0.0)
+    lim = (doc.get("task") or {}).get("time_limit_s")
+    if lim is None:
+        return [], 0.0, ["phase 2: the document has no task.time_limit_s: the audit cannot be checked"]
     planned = _n_picks(doc.get("task") or {}, formula) or int(doc.get("picks") or 0)
-    fake = float(p2.get("fake_pick_score", -1.0))
     pub = p2.get("audited") or {}
-    faked, bad, scores = [], [], {}
+    differ, bad, scores, overs = [], [], {}, []
     for j, i in enumerate(p2.get("scenes") or []):
         if i not in pos or str(i) not in pub:
             continue
@@ -448,14 +444,24 @@ def _audit(doc: dict, p2: dict, pos: dict) -> tuple[list, list[str]]:
         if rp is None:
             continue
         cut = k < len(outc) and outc[k] in CUT_OFF
-        a = audit_scene(picks1[k] if k < len(picks1) else [], rp, cut=cut, fake=fake, out_unit=unit, planned=planned)
+        a = audit_scene(picks1[k] if k < len(picks1) else [], rp, cut=cut, formula=formula, time_limit_s=float(lim),
+                        planned=planned)
         got = pub[str(i)]
-        if a["faked"] != got.get("faked") or not _close(got.get("score"), a["score"], SCORE_TOL):
-            bad.append(f"phase 2: audited scene {i} gives score {a['score']} (faked pick {a['faked']}), the document "
-                       f"says {got.get('score')} (faked pick {got.get('faked')})")
-        if a["faked"] is not None:
-            faked.append(i)
+        if not _close(got.get("score"), a["score"], SCORE_TOL) or not _close(got.get("over"), a["over"], SCORE_TOL):
+            bad.append(f"phase 2: audited scene {i} gives score {a['score']} (claim over the re-run by {a['over']}), "
+                       f"the document says {got.get('score')} (over by {got.get('over')})")
+        claimed_k = [pick_score(p, formula, float(lim)) for p in (picks1[k] if k < len(picks1) else [])
+                     if isinstance(p, dict)]
+        rerun_k = [pick_score(p, formula, float(lim)) for p in rp if isinstance(p, dict)]
+        n = a["compared"]
+        if any(abs(x - y) > 1e-6 for x, y in zip(claimed_k[:n], rerun_k[:n])) or (
+                not cut and len(claimed_k) != len(rerun_k)):
+            differ.append(i)
+        overs.append(a["over"])
         scores[i] = a["score"]
+    over = round(math.fsum(overs), 6)
+    if p2.get("over_claim") is not None and not _close(p2["over_claim"], over, SCORE_TOL * max(1, len(overs))):
+        bad.append(f"phase 2: over-claim {p2['over_claim']} is not the sum {over} of the audited scenes'")
     claimed = res.get("score") or []
     counted = [k for k in range(len(claimed)) if _verdict(res, k)]
     if counted and doc["phase1"].get("audited_score") is not None:
@@ -465,7 +471,7 @@ def _audit(doc: dict, p2: dict, pos: dict) -> tuple[list, list[str]]:
         if not _close(doc["phase1"]["audited_score"], want, MEAN_TOL):
             bad.append(f"phase 1: audited score {doc['phase1']['audited_score']} is not the mean {round(want, 6)} with "
                        "the audited scenes' scores")
-    return faked, bad
+    return differ, over, bad
 
 
 def phase2_check(doc: dict) -> dict | None:
@@ -500,9 +506,19 @@ def phase2_check(doc: dict) -> dict | None:
             over.append(i)
     n = len(idx) - len(unknown) - len(infra)
     if p2.get("audited") is not None:
-        mism, problems = _audit(doc, p2, pos)
+        mism, o, problems = _audit(doc, p2, pos)
+        tol = p2.get("fake_tolerance")
+        faked = tol is not None and o > float(tol)
+        if tol is None:
+            problems.append("phase 2: the document has an audit but no fake_tolerance")
+        elif p2.get("faked") is not None and bool(p2["faked"]) != faked:
+            problems.append(f"phase 2: faked = {p2['faked']}, but the over-claim {o} against the tolerance {tol} "
+                            f"gives {faked}")
+        if faked and p2.get("status") == "passed":
+            problems.append(f"phase 2: passed, but the claim is {o} points over the re-run (tolerance {tol})")
         return {"scenes": len(idx), "compared": n, "equal": n - len(mism), "mismatched": mism, "over_wall": over,
-                "infra": infra, "unknown": unknown, "passed": n > 0 and not over and not unknown,
+                "infra": infra, "unknown": unknown, "over_claim": o, "fake_tolerance": tol, "faked": faked,
+                "passed": n > 0 and not over and not unknown and not faked,
                 "status": p2.get("status"), "reason": p2.get("reason"), "audit_problems": problems}
     return {"scenes": len(idx), "compared": n, "equal": n - len(mism), "mismatched": mism, "over_wall": over,
             "infra": infra, "unknown": unknown, "passed": n > 0 and not mism and not over and not unknown,
@@ -743,12 +759,15 @@ def check_document(doc: dict, salt_sha256: str | None = None, salt_source: str =
                                f"(infrastructure failures left out: {p2['infra'][:10]})")
             at_decisive = legacy and doc.get("decisive") is not None
             if st == "disqualified" and p2["passed"] and not ours and not at_decisive:
-                bad.append("disqualified, but every phase-2 action hash equals phase 1's and every scene fits wall_s")
+                bad.append(f"disqualified, but the claim is {p2['over_claim']} points over the re-run (within the "
+                           f"tolerance {p2['fake_tolerance']}) and every scene fits wall_s" if "over_claim" in p2 else
+                           "disqualified, but every phase-2 action hash equals phase 1's and every scene fits wall_s")
             if st == "disqualified" and not (doc["phase2"].get("reason") or sub.get("reason")):
                 bad.append("disqualified without a reason")
             if st in ("ranked", "not_ranked", "crowned", "not_crowned") and not p2["passed"]:
                 bad.append(f"{st}, but phase 2 did not pass (mismatched {p2['mismatched'][:10]}, "
-                           f"over the wall {p2['over_wall'][:10]}, compared {p2['compared']})")
+                           f"over the wall {p2['over_wall'][:10]}, compared {p2['compared']}"
+                           + (f", over-claim {p2['over_claim']}" if "over_claim" in p2 else "") + ")")
     bad += _final_problems(doc, st, warnings)
     if not legacy:
         bad += _decision_problems(doc, st, p2)
